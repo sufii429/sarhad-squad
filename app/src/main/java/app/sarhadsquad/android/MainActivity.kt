@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas as NativeCanvas
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Typeface
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
@@ -36,18 +37,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.foundation.layout.offset
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -64,8 +67,11 @@ import kotlin.math.sqrt
 import kotlin.random.Random
 
 // ============================================================================
-// Sarhad Squad: Border War — Mission 1 prototype (v0.3.1)
+// Sarhad Squad: Border War — Mission 1 prototype (v0.4.0)
 // Pixel-art squad shooter. TITLE -> GAME -> RESULT state machine.
+// v0.4.0 adds the Stage-1 Feel Pack: visible projectiles, explosion
+// feedback + scorch marks, Canvas damage numbers, combo counter, range
+// ring, floating joystick, crate pickups, hit flashes, dust puffs.
 // All in-game text is English only.
 // ============================================================================
 
@@ -74,10 +80,18 @@ enum class Faction { PAKISTAN, INDIA }
 enum class Screen { TITLE, GAME, RESULT }
 
 // Effect kinds (drawn in the Canvas, removed when ttl runs out).
-const val FX_TRACER = 0
-const val FX_ENEMY_TRACER = 1
-const val FX_HIT = 2
-const val FX_BLAST = 3
+// Tracers are gone in v0.4.0 — fire is carried by real Bullet entities.
+const val FX_HIT = 0
+const val FX_BLAST = 1
+
+// Particle kinds for the feel-pack particle list.
+const val PT_SPARK = 0
+const val PT_FLAME = 1
+const val PT_DUST = 2
+
+// Pickup kinds dropped by destroyed crates.
+const val PICKUP_MEDKIT = 0
+const val PICKUP_RAPID = 1
 
 fun distBetween(ax: Float, ay: Float, bx: Float, by: Float): Float {
     val dx = ax - bx
@@ -118,12 +132,14 @@ class Enemy(val ax: Float, val ay: Float, val phase: Float) {
     val maxHp = 48f
     var cd = 0f
     var alive = true
+    var flash = 0f // hit-flash timer (white tint while > 0)
 }
 
 class CrateEnt(var x: Float, var y: Float) {
     var hp = 45f
     val maxHp = 45f
     var destroyed = false
+    var flash = 0f // hit-flash timer (white tint while > 0)
 }
 
 class Obstacle(var x: Float, var y: Float, val r: Float, val tree: Boolean)
@@ -137,6 +153,56 @@ class Effect(
     var ttl: Float,
     val maxTtl: Float
 )
+
+/** A travelling projectile. Damage lands on arrival / proximity, not on fire. */
+class Bullet(
+    var x: Float,
+    var y: Float,
+    val vx: Float,
+    val vy: Float,
+    val dirX: Float,
+    val dirY: Float,
+    val endX: Float,
+    val endY: Float,
+    val fromEnemy: Boolean,
+    val damage: Float,
+    val targetEnemy: Enemy? = null,
+    val targetCrate: CrateEnt? = null,
+    val targetMember: Member? = null
+)
+
+/** One feel-pack particle square (explosion spark, lingering flame, dust). */
+class Particle(
+    var x: Float,
+    var y: Float,
+    var vx: Float,
+    var vy: Float,
+    var ttl: Float,
+    val maxTtl: Float,
+    val size: Float,
+    val color: Color,
+    val kind: Int
+)
+
+/** World-anchored floating text, drawn inside the Canvas (damage numbers). */
+class FloatText(
+    var x: Float,
+    var y: Float,
+    val text: String,
+    var ttl: Float,
+    val maxTtl: Float,
+    val size: Float,
+    val argb: Int
+)
+
+/** Permanent dark scorch patch left on the ground by an explosion. */
+class Scorch(val x: Float, val y: Float, val r: Float, val seed: Int)
+
+/** A dead enemy's figure, fading out over 0.25 s instead of vanishing. */
+class DeathFade(val x: Float, val y: Float, val facing: Offset, var ttl: Float)
+
+/** A pickup dropped by a destroyed crate, waiting on the ground. */
+class Pickup(val x: Float, val y: Float, val kind: Int, val phase: Float)
 
 class GameWorld {
     var initialized = false
@@ -152,6 +218,21 @@ class GameWorld {
     val crates = mutableListOf<CrateEnt>()
     val obstacles = mutableListOf<Obstacle>()
     val effects = mutableListOf<Effect>()
+    // Feel-pack state (v0.4.0).
+    val bullets = mutableListOf<Bullet>()
+    val particles = mutableListOf<Particle>()
+    val floaters = mutableListOf<FloatText>()
+    val scorches = mutableListOf<Scorch>()
+    val deaths = mutableListOf<DeathFade>()
+    val pickups = mutableListOf<Pickup>()
+    var combo = 0
+    var comboTimer = 0f
+    var rapidTimer = 0f
+    var shake = 0f
+    var dustTimer = 0f
+    var pickupAlt = false
+    var flashText = ""
+    var flashTtl = 0f
 }
 
 /** Spawn everything as fractions of the canvas size, once the size is known. */
@@ -249,6 +330,140 @@ fun moveEnemyToward(e: Enemy, tx: Float, ty: Float, speed: Float, dt: Float) {
     val stepLen = min(d, speed * dt)
     e.x += (tx - e.x) / d * stepLen
     e.y += (ty - e.y) / d * stepLen
+}
+
+// --- Feel-pack helpers (v0.4.0): every damage path funnels through here ----
+
+/** Rising, fading world-anchored text (drawn later inside the Canvas). */
+fun addFloater(
+    world: GameWorld, x: Float, y: Float, text: String,
+    size: Float = 26f, argb: Long = 0xFFFFFFFF, ttl: Float = 0.7f
+) {
+    world.floaters.add(FloatText(x, y, text, ttl, ttl, size, argb.toInt()))
+}
+
+/** Expanding fire cluster + a few lingering flames at (x, y). */
+fun spawnExplosion(world: GameWorld, x: Float, y: Float, big: Boolean) {
+    val fireColors = listOf(
+        Color(0xFFFF5722), Color(0xFFFF9800), Color(0xFFFFC107), Color(0xFFD32F2F)
+    )
+    val sparks = if (big) 16 else 10
+    for (i in 0 until sparks) {
+        val ang = Random.nextFloat() * (2f * Math.PI.toFloat())
+        val spd = 40f + Random.nextFloat() * 140f
+        val ttl = 0.18f + Random.nextFloat() * 0.17f
+        world.particles.add(
+            Particle(
+                x, y - 20f, cos(ang.toDouble()).toFloat() * spd,
+                sin(ang.toDouble()).toFloat() * spd,
+                ttl, ttl, 5f + Random.nextFloat() * 6f,
+                fireColors[i % fireColors.size], PT_SPARK
+            )
+        )
+    }
+    val flames = if (big) 6 else 4
+    for (i in 0 until flames) {
+        world.particles.add(
+            Particle(
+                x + (Random.nextFloat() - 0.5f) * 44f,
+                y - 8f + (Random.nextFloat() - 0.5f) * 20f,
+                0f, -12f, 0.8f, 0.8f,
+                6f + Random.nextFloat() * 6f,
+                if (i % 2 == 0) Color(0xFFFF9800) else Color(0xFFFFC107), PT_FLAME
+            )
+        )
+    }
+}
+
+/** Smaller red/dark burst when an enemy dies. */
+fun spawnDeathBurst(world: GameWorld, x: Float, y: Float) {
+    val cols = listOf(Color(0xFFD32F2F), Color(0xFF7B1FA2), Color(0xFF37474F))
+    for (i in 0 until 8) {
+        val ang = Random.nextFloat() * (2f * Math.PI.toFloat())
+        val spd = 30f + Random.nextFloat() * 90f
+        val ttl = 0.15f + Random.nextFloat() * 0.1f
+        world.particles.add(
+            Particle(
+                x, y - 40f, cos(ang.toDouble()).toFloat() * spd,
+                sin(ang.toDouble()).toFloat() * spd,
+                ttl, ttl, 4f + Random.nextFloat() * 4f,
+                cols[i % cols.size], PT_SPARK
+            )
+        )
+    }
+}
+
+/** Combo bookkeeping: kills inside a 2.5 s window chain the counter. */
+fun registerKill(world: GameWorld) {
+    world.combo = if (world.comboTimer > 0f) world.combo + 1 else 1
+    world.comboTimer = 2.5f
+}
+
+fun killEnemy(world: GameWorld, e: Enemy) {
+    e.hp = 0f
+    e.alive = false
+    val nearest = world.members
+        .filter { !it.down }
+        .minByOrNull { distBetween(e.x, e.y, it.x, it.y) }
+    val facing = if (nearest != null) {
+        facingToward(e.x, e.y, nearest.x, nearest.y, Offset(0f, 1f))
+    } else Offset(0f, 1f)
+    world.deaths.add(DeathFade(e.x, e.y, facing, 0.25f))
+    spawnDeathBurst(world, e.x, e.y)
+    registerKill(world)
+}
+
+/** Damage to an enemy from any source; shows the floating damage number. */
+fun damageEnemy(world: GameWorld, e: Enemy, dmg: Float) {
+    if (!e.alive) return
+    e.hp -= dmg
+    e.flash = 0.06f
+    if (e.hp <= 0f) {
+        addFloater(world, e.x, e.y - 78f, dmg.toInt().toString(), 36f, 0xFFFFEB3B)
+        killEnemy(world, e)
+    } else {
+        addFloater(world, e.x, e.y - 78f, dmg.toInt().toString(), 26f, 0xFFFFFFFF)
+    }
+    world.effects.add(Effect(FX_HIT, e.x, e.y, e.x, e.y, 0.12f, 0.12f))
+}
+
+/** Full destruction feedback for a crate: explosion, scorch, shake, drop. */
+fun onCrateDestroyed(world: GameWorld, c: CrateEnt) {
+    spawnExplosion(world, c.x, c.y, big = true)
+    world.scorches.add(Scorch(c.x, c.y + 8f, 44f, (c.x * 7f + c.y).toInt()))
+    world.shake = max(world.shake, 8f)
+    if (Random.nextFloat() < 0.5f) {
+        world.pickupAlt = !world.pickupAlt
+        val kind = if (world.pickupAlt) PICKUP_MEDKIT else PICKUP_RAPID
+        world.pickups.add(Pickup(c.x, c.y, kind, Random.nextFloat() * 6.28f))
+    }
+}
+
+/** Damage to a crate from any source; shows the floating damage number. */
+fun damageCrate(world: GameWorld, c: CrateEnt, dmg: Float) {
+    if (c.destroyed) return
+    c.hp -= dmg
+    c.flash = 0.06f
+    if (c.hp <= 0f) {
+        c.hp = 0f
+        c.destroyed = true
+        addFloater(world, c.x, c.y - 52f, dmg.toInt().toString(), 36f, 0xFFFFEB3B)
+        onCrateDestroyed(world, c)
+    } else {
+        addFloater(world, c.x, c.y - 52f, dmg.toInt().toString(), 26f, 0xFFFFFFFF)
+    }
+}
+
+/** Damage to a squad member from any source; downs them at zero HP. */
+fun damageMember(world: GameWorld, m: Member, dmg: Float) {
+    if (m.down) return
+    m.hp -= dmg
+    addFloater(world, m.x, m.y - 84f, dmg.toInt().toString(), 26f, 0xFFFF8A80)
+    if (m.hp <= 0f) {
+        m.hp = 0f
+        m.down = true
+        m.wasDowned = true
+    }
 }
 
 // --- Activity + app root -----------------------------------------------------
@@ -452,6 +667,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
     var frameTick by remember { mutableIntStateOf(0) }
     var holdOn by remember { mutableStateOf(false) }
     var joyVec by remember { mutableStateOf(Offset.Zero) }
+    var joyBase by remember { mutableStateOf<Offset?>(null) }
 
     fun throwGrenade() {
         if (!world.initialized || world.finished || world.grenadeCd > 0f) return
@@ -473,17 +689,18 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
             ?: return
         for (e in world.enemies) {
             if (e.alive && distBetween(center.x, center.y, e.x, e.y) <= 115f) {
-                e.hp -= 60f
-                if (e.hp <= 0f) { e.hp = 0f; e.alive = false }
+                damageEnemy(world, e, 60f)
             }
         }
         for (c in world.crates) {
             if (!c.destroyed && distBetween(center.x, center.y, c.x, c.y) <= 115f) {
-                c.hp -= 60f
-                if (c.hp <= 0f) { c.hp = 0f; c.destroyed = true }
+                damageCrate(world, c, 60f)
             }
         }
         world.effects.add(Effect(FX_BLAST, center.x, center.y, center.x, center.y, 0.35f, 0.35f))
+        spawnExplosion(world, center.x, center.y, big = true)
+        world.scorches.add(Scorch(center.x, center.y, 52f, (center.x * 3f + center.y).toInt()))
+        world.shake = max(world.shake, 8f)
         world.grenadeCd = 6f
     }
 
@@ -506,13 +723,26 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
         world.elapsed += dt
         if (world.grenadeCd > 0f) world.grenadeCd = max(0f, world.grenadeCd - dt)
 
+        // -- Feel-pack timers. --
+        if (world.rapidTimer > 0f) world.rapidTimer = max(0f, world.rapidTimer - dt)
+        if (world.comboTimer > 0f) {
+            world.comboTimer = max(0f, world.comboTimer - dt)
+            if (world.comboTimer <= 0f) world.combo = 0
+        }
+        if (world.flashTtl > 0f) world.flashTtl = max(0f, world.flashTtl - dt)
+        if (world.shake > 0f) world.shake = max(0f, world.shake - dt * 30f)
+        for (e in world.enemies) if (e.flash > 0f) e.flash = max(0f, e.flash - dt)
+        for (c in world.crates) if (c.flash > 0f) c.flash = max(0f, c.flash - dt)
+
         // -- Squad movement: anchor moves, members follow with offsets. --
+        var squadMovingNow = false
         if (!holdOn) {
             val len = joyVec.getDistance()
             if (len > 3f) {
                 val mag = (len / 60f).coerceIn(0f, 1f)
-                world.anchorX += joyVec.x / len * 155f * mag * dt
-                world.anchorY += joyVec.y / len * 155f * mag * dt
+                world.anchorX += joyVec.x / len * 180f * mag * dt
+                world.anchorY += joyVec.y / len * 180f * mag * dt
+                squadMovingNow = true
             }
         }
         world.anchorX = world.anchorX.coerceIn(28f, world.w - 28f)
@@ -525,12 +755,30 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
             if (m.name == "HAWK") {
                 m.x = tx; m.y = ty
             } else {
-                val stiff = if (m.name == "BULL") 5.5f else 7.5f
+                val stiff = (if (m.name == "BULL") 5.5f else 7.5f) * 1.25f
                 val t = min(1f, dt * stiff)
                 m.x += (tx - m.x) * t
                 m.y += (ty - m.y) * t
             }
             pushMemberOut(world, m)
+        }
+        // Dust puffs at the squad's feet while on the move.
+        if (squadMovingNow) {
+            world.dustTimer -= dt
+            if (world.dustTimer <= 0f) {
+                world.dustTimer = 0.12f
+                for (m in world.members) {
+                    if (m.down) continue
+                    world.particles.add(
+                        Particle(
+                            m.x + (Random.nextFloat() - 0.5f) * 18f, m.y + 4f,
+                            (Random.nextFloat() - 0.5f) * 14f, -9f,
+                            0.4f, 0.4f, 7f + Random.nextFloat() * 6f,
+                            Color(0xFFD6C29A), PT_DUST
+                        )
+                    )
+                }
+            }
         }
 
         // -- Enemies: patrol, or approach and fire when the squad is near. --
@@ -546,15 +794,20 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
                 if (d > 170f) moveEnemyToward(e, nearest.x, nearest.y, 58f, dt)
                 if (e.cd <= 0f && d <= 320f) {
                     e.cd = 0.9f
-                    nearest.hp -= 5f + Random.nextFloat() * 3f
-                    world.effects.add(
-                        Effect(FX_ENEMY_TRACER, e.x, e.y, nearest.x, nearest.y, 0.08f, 0.08f)
+                    // Visible projectile: flies at the member's position at
+                    // fire time, so a moving member can dodge it.
+                    val dir = facingToward(e.x, e.y, nearest.x, nearest.y, Offset(0f, 1f))
+                    world.bullets.add(
+                        Bullet(
+                            e.x, e.y, dir.x * 540f, dir.y * 540f, dir.x, dir.y,
+                            nearest.x, nearest.y, fromEnemy = true,
+                            damage = 5f + Random.nextFloat() * 3f,
+                            targetMember = nearest
+                        )
                     )
-                    if (nearest.hp <= 0f) {
-                        nearest.hp = 0f
-                        nearest.down = true
-                        nearest.wasDowned = true
-                    }
+                    world.effects.add(
+                        Effect(FX_HIT, e.x, e.y, e.x, e.y, 0.08f, 0.08f)
+                    )
                 }
             } else {
                 val wx = e.ax + (cos((world.elapsed * 0.35f + e.phase).toDouble()) * 46.0).toFloat()
@@ -563,7 +816,8 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
             }
         }
 
-        // -- Squad auto-fire: nearest enemy in range, else nearest crate. --
+        // -- Squad auto-fire: nearest enemy in range, else nearest crate.
+        // Fire spawns a bullet; damage lands when the bullet arrives. --
         for (m in world.members) {
             if (m.down) continue
             m.cd -= dt
@@ -573,23 +827,144 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
                 .filter { it.alive }
                 .minByOrNull { distBetween(m.x, m.y, it.x, it.y) }
             if (target != null && distBetween(m.x, m.y, target.x, target.y) <= 285f) {
-                target.hp -= m.damage
-                world.effects.add(Effect(FX_TRACER, m.x, m.y, target.x, target.y, 0.07f, 0.07f))
-                world.effects.add(Effect(FX_HIT, target.x, target.y, target.x, target.y, 0.12f, 0.12f))
-                if (target.hp <= 0f) { target.hp = 0f; target.alive = false }
+                val dir = facingToward(m.x, m.y, target.x, target.y, Offset(0f, -1f))
+                world.bullets.add(
+                    Bullet(
+                        m.x, m.y, dir.x * 950f, dir.y * 950f, dir.x, dir.y,
+                        target.x, target.y, fromEnemy = false,
+                        damage = m.damage, targetEnemy = target
+                    )
+                )
+                world.effects.add(Effect(FX_HIT, m.x, m.y, m.x, m.y, 0.08f, 0.08f))
                 fired = true
             } else {
                 val crate = world.crates
                     .filter { !it.destroyed }
                     .minByOrNull { distBetween(m.x, m.y, it.x, it.y) }
                 if (crate != null && distBetween(m.x, m.y, crate.x, crate.y) <= 285f) {
-                    crate.hp -= m.damage
-                    world.effects.add(Effect(FX_TRACER, m.x, m.y, crate.x, crate.y, 0.07f, 0.07f))
-                    if (crate.hp <= 0f) { crate.hp = 0f; crate.destroyed = true }
+                    val dir = facingToward(m.x, m.y, crate.x, crate.y, Offset(0f, -1f))
+                    world.bullets.add(
+                        Bullet(
+                            m.x, m.y, dir.x * 950f, dir.y * 950f, dir.x, dir.y,
+                            crate.x, crate.y, fromEnemy = false,
+                            damage = m.damage, targetCrate = crate
+                        )
+                    )
+                    world.effects.add(Effect(FX_HIT, m.x, m.y, m.x, m.y, 0.08f, 0.08f))
                     fired = true
                 }
             }
-            if (fired) m.cd = m.fireInterval
+            if (fired) {
+                m.cd = m.fireInterval * if (world.rapidTimer > 0f) 0.6f else 1f
+            }
+        }
+
+        // -- Bullets in flight: damage applies on arrival / proximity. --
+        val bit = world.bullets.iterator()
+        while (bit.hasNext()) {
+            val b = bit.next()
+            b.x += b.vx * dt
+            b.y += b.vy * dt
+            val speed = sqrt(b.vx * b.vx + b.vy * b.vy)
+            val remaining = distBetween(b.x, b.y, b.endX, b.endY)
+            var spent = false
+            if (!b.fromEnemy) {
+                if (remaining <= speed * dt * 1.05f + 2f) {
+                    val te = b.targetEnemy
+                    val tc = b.targetCrate
+                    if (te != null) {
+                        if (te.alive &&
+                            distBetween(te.x, te.y, b.endX, b.endY) <= 40f
+                        ) {
+                            damageEnemy(world, te, b.damage)
+                        }
+                    } else if (tc != null) {
+                        if (!tc.destroyed &&
+                            distBetween(tc.x, tc.y, b.endX, b.endY) <= 40f
+                        ) {
+                            damageCrate(world, tc, b.damage)
+                        }
+                    }
+                    spent = true
+                }
+            } else {
+                val tm = b.targetMember
+                if (tm != null && !tm.down &&
+                    distBetween(b.x, b.y, tm.x, tm.y) <= 30f
+                ) {
+                    damageMember(world, tm, b.damage)
+                    spent = true
+                } else if (remaining <= speed * dt * 1.05f + 2f) {
+                    spent = true // flew past the aim point — a clean miss
+                }
+            }
+            if (spent) bit.remove()
+        }
+
+        // -- Particles: sparks fly out, flames linger, dust drifts up. --
+        val pit = world.particles.iterator()
+        while (pit.hasNext()) {
+            val p = pit.next()
+            p.ttl -= dt
+            if (p.ttl <= 0f) {
+                pit.remove()
+                continue
+            }
+            when (p.kind) {
+                PT_SPARK -> {
+                    p.x += p.vx * dt
+                    p.y += p.vy * dt
+                    p.vx *= (1f - 2.2f * dt)
+                    p.vy *= (1f - 2.2f * dt)
+                }
+                PT_DUST -> {
+                    p.x += p.vx * dt
+                    p.y += p.vy * dt
+                }
+            }
+        }
+
+        // -- Floating texts rise and fade. --
+        val fit = world.floaters.iterator()
+        while (fit.hasNext()) {
+            val f = fit.next()
+            f.ttl -= dt
+            f.y -= 42f * dt
+            if (f.ttl <= 0f) fit.remove()
+        }
+
+        // -- Death fades count down. --
+        val dit = world.deaths.iterator()
+        while (dit.hasNext()) {
+            val d = dit.next()
+            d.ttl -= dt
+            if (d.ttl <= 0f) dit.remove()
+        }
+
+        // -- Pickups: collected when a standing member comes close. --
+        val kit = world.pickups.iterator()
+        while (kit.hasNext()) {
+            val pk = kit.next()
+            val touched = world.members.any {
+                !it.down && distBetween(it.x, it.y, pk.x, pk.y) <= 45f
+            }
+            if (!touched) continue
+            kit.remove()
+            if (pk.kind == PICKUP_MEDKIT) {
+                val hurt = world.members
+                    .filter { !it.down }
+                    .minByOrNull { it.hp }
+                if (hurt != null) {
+                    hurt.hp = min(hurt.maxHp, hurt.hp + 25f)
+                }
+                addFloater(world, pk.x, pk.y - 30f, "+25 HP", 32f, 0xFF69F0AE, 1.0f)
+                world.flashText = "+25 HP"
+            } else {
+                world.rapidTimer = 8f
+                addFloater(world, pk.x, pk.y - 30f, "RAPID FIRE!", 32f, 0xFFFFEB3B, 1.0f)
+                world.flashText = "RAPID FIRE!"
+            }
+            world.flashTtl = 1.6f
         }
 
         // -- Effects expiry. --
@@ -641,35 +1016,52 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
                 .pointerInput(Unit) {
                     awaitPointerEventScope {
                         var joyActive = false
+                        var pressPos: Offset? = null
                         var tapStart: Offset? = null
                         while (true) {
                             val event = awaitPointerEvent()
                             val change = event.changes.firstOrNull() ?: continue
-                            val jc = Offset(size.width * 0.17f, size.height * 0.80f)
                             when {
                                 change.pressed && !change.previousPressed -> {
-                                    if ((change.position - jc).getDistance() < 120f) {
+                                    pressPos = change.position
+                                    if (change.position.x < size.width * 0.65f) {
+                                        // Floating joystick: the base is
+                                        // wherever the thumb lands.
                                         joyActive = true
-                                        val v = change.position - jc
-                                        val l = v.getDistance()
-                                        joyVec = if (l > 60f) v / l * 60f else v
+                                        joyBase = change.position
+                                        joyVec = Offset.Zero
                                     } else {
                                         tapStart = change.position
                                     }
                                 }
                                 change.pressed && joyActive -> {
-                                    val v = change.position - jc
+                                    val base = joyBase ?: change.position
+                                    val v = change.position - base
                                     val l = v.getDistance()
                                     joyVec = if (l > 60f) v / l * 60f else v
                                 }
                                 !change.pressed && change.previousPressed -> {
                                     if (joyActive) {
                                         joyActive = false
+                                        // A near-stationary press on the
+                                        // joystick side still counts as a
+                                        // tap (revive a downed member).
+                                        val pp = pressPos
+                                        if (pp != null &&
+                                            distBetween(
+                                                pp.x, pp.y,
+                                                change.position.x, change.position.y
+                                            ) < 24f
+                                        ) {
+                                            handleTap(pp)
+                                        }
                                         joyVec = Offset.Zero
+                                        joyBase = null
                                     } else {
                                         tapStart?.let { handleTap(it) }
                                         tapStart = null
                                     }
+                                    pressPos = null
                                 }
                             }
                         }
@@ -679,24 +1071,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
             // Reading frameTick here redraws the canvas every frame.
             val tick = frameTick
             if (tick >= 0 && world.initialized) {
-                drawGame(world, faction, joyVec, holdOn, art)
-            }
-        }
-
-        // Call-sign labels above squad members (Compose text over the canvas).
-        if (world.initialized) {
-            val tick = frameTick
-            for (m in world.members) {
-                if (tick < -1) continue
-                Text(
-                    if (m.down) "DOWN" else m.name,
-                    color = if (m.down) Color(0xFFFF5252) else Color.White,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.offset {
-                        IntOffset((m.x - 22f).toInt(), (m.y - 134f).toInt())
-                    }
-                )
+                drawGame(world, faction, joyVec, joyBase, holdOn, art)
             }
         }
 
@@ -730,6 +1105,26 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
             ) {
                 Text("Time: ${formatTime(world.elapsed)}", color = Color(0xFFCFD8C3), fontSize = 13.sp)
                 Text(hpLine, color = Color(0xFFCFD8C3), fontSize = 13.sp)
+            }
+            if (world.combo >= 2) {
+                Text(
+                    "COMBO ×${world.combo}",
+                    color = Color(0xFFFF5DA2),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            if (world.flashTtl > 0f && world.flashText.isNotEmpty()) {
+                Text(
+                    world.flashText,
+                    color = Color(0xFFFFEB3B),
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
         }
 
@@ -1267,6 +1662,26 @@ private fun paintFence(): ImageBitmap = pixelBitmap(16, 12) { p ->
     p.px(6, 2, wire); p.px(12, 6, wire)
 }
 
+/** Medkit pickup icon, native 14x14: white box, red cross. */
+private fun paintMedkit(): ImageBitmap = pixelBitmap(14, 14) { p ->
+    p.rect(0, 0, 14, 14, PX_OUTLINE)
+    p.rect(1, 1, 12, 12, argb(0xFFF5F5F5))
+    p.rect(1, 1, 12, 2, argb(0xFFBDBDBD))
+    val red = argb(0xFFD32F2F)
+    p.rect(6, 3, 2, 8, red)
+    p.rect(3, 6, 8, 2, red)
+}
+
+/** Rapid-fire pickup icon, native 14x14: dark box, yellow bolt. */
+private fun paintRapid(): ImageBitmap = pixelBitmap(14, 14) { p ->
+    p.rect(0, 0, 14, 14, PX_OUTLINE)
+    p.rect(1, 1, 12, 12, argb(0xFF263238))
+    val bolt = argb(0xFFFFEB3B)
+    p.rect(7, 2, 3, 5, bolt)
+    p.rect(5, 6, 4, 2, bolt)
+    p.rect(4, 8, 3, 4, bolt)
+}
+
 /** All pre-rendered art for the game screen. Built once, remembered. */
 class PixelArt(
     val dirt: ImageBitmap,
@@ -1287,7 +1702,9 @@ class PixelArt(
     val crate: ImageBitmap,
     val tree: ImageBitmap,
     val rock: ImageBitmap,
-    val tower: ImageBitmap
+    val tower: ImageBitmap,
+    val medkit: ImageBitmap,
+    val rapid: ImageBitmap
 )
 
 fun buildPixelArt(): PixelArt {
@@ -1346,7 +1763,9 @@ fun buildPixelArt(): PixelArt {
         crate = paintCrate(),
         tree = paintTree(),
         rock = paintRock(),
-        tower = paintTower()
+        tower = paintTower(),
+        medkit = paintMedkit(),
+        rapid = paintRapid()
     )
 }
 
@@ -1358,15 +1777,44 @@ private fun DrawScope.blit(
     top: Float,
     w: Int,
     h: Int,
-    alpha: Float = 1f
+    alpha: Float = 1f,
+    colorFilter: ColorFilter? = null
 ) {
     drawImage(
         image = bmp,
         dstOffset = IntOffset(left.toInt(), top.toInt()),
         dstSize = IntSize(w, h),
         alpha = alpha,
+        colorFilter = colorFilter,
         filterQuality = FilterQuality.None
     )
+}
+
+/** White silhouette flash used for the 60 ms hit flash. */
+private val HIT_FLASH_FILTER: ColorFilter =
+    ColorFilter.tint(Color(0xBFFFFFFF), BlendMode.SrcIn)
+
+// Shared paint for all Canvas-drawn world text (labels + floating numbers).
+private val canvasTextPaint = Paint().apply {
+    isAntiAlias = true
+    typeface = Typeface.DEFAULT_BOLD
+    textAlign = Paint.Align.CENTER
+}
+
+/** World-anchored text drawn inside the Canvas so it tracks the world. */
+private fun DrawScope.drawCanvasText(
+    text: String,
+    cx: Float,
+    baselineY: Float,
+    sizePx: Float,
+    argbColor: Int,
+    alphaFrac: Float = 1f
+) {
+    val paint = canvasTextPaint
+    paint.textSize = sizePx
+    paint.color = argbColor
+    paint.alpha = (alphaFrac.coerceIn(0f, 1f) * 255f).toInt()
+    drawContext.canvas.nativeCanvas.drawText(text, cx, baselineY, paint)
 }
 
 /** Tile [bmp] across a rect at uniform scale (192x192 world per tile). */
@@ -1416,7 +1864,10 @@ fun DrawScope.drawRock(art: PixelArt, o: Obstacle) {
 fun DrawScope.drawCrate(art: PixelArt, c: CrateEnt) {
     val alpha = if (c.destroyed) 0.45f else 1f
     drawShadow(c.x + 3f, c.y + 30f, 30f, 7f)
-    blit(art.crate, c.x - 36f, c.y - 36f, 72, 72, alpha)
+    blit(
+        art.crate, c.x - 36f, c.y - 36f, 72, 72, alpha,
+        colorFilter = if (c.flash > 0f) HIT_FLASH_FILTER else null
+    )
     if (!c.destroyed && c.hp < c.maxHp) {
         drawHealthBar(c.x, c.y - 48f, c.hp / c.maxHp)
     }
@@ -1434,7 +1885,9 @@ fun DrawScope.drawStandingFigure(
     facing: Offset,
     stepPhase: Float,
     moving: Boolean,
-    set: Map<PixelFacing, Array<ImageBitmap>>
+    set: Map<PixelFacing, Array<ImageBitmap>>,
+    alpha: Float = 1f,
+    flash: Boolean = false
 ) {
     val pixelFacing = if (kotlin.math.abs(facing.y) >= kotlin.math.abs(facing.x)) {
         if (facing.y >= 0f) PixelFacing.DOWN else PixelFacing.UP
@@ -1445,7 +1898,11 @@ fun DrawScope.drawStandingFigure(
         (kotlin.math.floor(stepPhase / Math.PI).toInt() and 1)
     } else 0
     drawShadow(x, groundY + 4f, 23f, 5f)
-    blit(set.getValue(pixelFacing)[frame], x - 38f, groundY - 95f, 76, 95)
+    blit(
+        set.getValue(pixelFacing)[frame], x - 38f, groundY - 95f, 76, 95,
+        alpha = alpha,
+        colorFilter = if (flash) HIT_FLASH_FILTER else null
+    )
 }
 
 /** Downed member: lying-flat sprite (native 28x13 drawn 88x41). */
@@ -1454,27 +1911,34 @@ fun DrawScope.drawDownFigure(art: PixelArt, x: Float, y: Float) {
     blit(art.downed, x - 44f, y - 18f, 88, 41)
 }
 
-/** Tracer as a chain of small squares, from chest height to chest height. */
-fun DrawScope.drawPixelTracer(
-    x1: Float, y1: Float, x2: Float, y2: Float,
-    color: Color, alpha: Float
-) {
-    val fromX = x1
-    val fromY = y1 - 55f
-    val toX = x2
-    val toY = y2 - 55f
-    val d = distBetween(fromX, fromY, toX, toY)
-    if (d < 1f) return
-    val steps = (d / 16f).toInt().coerceIn(1, 24)
-    val c = color.copy(alpha = alpha)
-    for (i in 0..steps) {
-        val t = i / steps.toFloat()
+/** One bullet in flight: a bright square at chest height + 2 trail squares. */
+fun DrawScope.drawBullet(b: Bullet) {
+    val cy = b.y - 55f
+    val head = if (b.fromEnemy) Color(0xFFFF7043) else Color(0xFFFFF59D)
+    val trail = if (b.fromEnemy) Color(0xFFFFAB91) else Color(0xFFFFFFFF)
+    for (i in 2 downTo 1) {
+        val tx = b.x - b.dirX * 10f * i
+        val ty = cy - b.dirY * 10f * i
+        val s = 6f - 1.6f * i
         drawRect(
-            color = c,
-            topLeft = Offset(fromX + (toX - fromX) * t - 2.5f, fromY + (toY - fromY) * t - 2.5f),
-            size = Size(5f, 5f)
+            color = trail.copy(alpha = 0.55f - 0.18f * i),
+            topLeft = Offset(tx - s / 2f, ty - s / 2f),
+            size = Size(s, s)
         )
     }
+    drawRect(
+        color = head,
+        topLeft = Offset(b.x - 3.5f, cy - 3.5f),
+        size = Size(7f, 7f)
+    )
+}
+
+/** A pickup on the ground: shadow + bobbing pixel icon. */
+fun DrawScope.drawPickup(art: PixelArt, pk: Pickup, elapsed: Float) {
+    val bob = sin((elapsed * 3f + pk.phase).toDouble()).toFloat() * 3f
+    drawShadow(pk.x, pk.y + 12f, 15f, 4f)
+    val bmp = if (pk.kind == PICKUP_MEDKIT) art.medkit else art.rapid
+    blit(bmp, pk.x - 16f, pk.y - 16f + bob, 32, 32)
 }
 
 /** Hit flash as a plus-shaped pixel burst at (cx, cy). */
@@ -1520,12 +1984,49 @@ fun DrawScope.drawGame(
     world: GameWorld,
     faction: Faction,
     joyVec: Offset,
+    joyBase: Offset?,
     holdOn: Boolean,
     art: PixelArt
 ) {
     val w = world.w
     val h = world.h
     if (w <= 0f || h <= 0f) return
+
+    // Screen shake: the world (not the joystick) jitters on explosions.
+    if (world.shake > 0f) {
+        val sx = sin((world.elapsed * 95f).toDouble()).toFloat() * world.shake
+        val sy = cos((world.elapsed * 121f).toDouble()).toFloat() * world.shake * 0.7f
+        withTransform({ translate(sx, sy) }) {
+            drawGameWorld(world, faction, joyVec, holdOn, art)
+        }
+    } else {
+        drawGameWorld(world, faction, joyVec, holdOn, art)
+    }
+
+    // Floating joystick: drawn wherever the player's thumb landed.
+    val base = joyBase
+    if (base != null) {
+        drawCircle(color = Color.White.copy(alpha = 0.16f), radius = 62f, center = base)
+        drawCircle(
+            color = Color.White.copy(alpha = 0.45f),
+            radius = 62f,
+            center = base,
+            style = Stroke(width = 2f)
+        )
+        val knob = base + joyVec * 0.62f
+        drawCircle(color = Color.White.copy(alpha = 0.38f), radius = 26f, center = knob)
+    }
+}
+
+private fun DrawScope.drawGameWorld(
+    world: GameWorld,
+    faction: Faction,
+    joyVec: Offset,
+    holdOn: Boolean,
+    art: PixelArt
+) {
+    val w = world.w
+    val h = world.h
 
     // ---- Ground layer: dirt base, plots, road, canal, fence. ----
     // Dirt bitmap tiled over the whole map: plots sit ON it, with dirt
@@ -1603,6 +2104,47 @@ fun DrawScope.drawGame(
         fenceX += 48f
     }
 
+    // Permanent scorch patches left behind by explosions.
+    for (s in world.scorches) {
+        drawOval(
+            color = Color.Black.copy(alpha = 0.34f),
+            topLeft = Offset(s.x - s.r, s.y - s.r * 0.55f),
+            size = Size(s.r * 2f, s.r * 1.1f)
+        )
+        for (i in 0 until 5) {
+            val hh = pixelHash(i, s.seed, 31)
+            val ox = Math.floorMod(hh, (s.r * 1.4f).toInt()).toFloat() - s.r * 0.7f
+            val oy = Math.floorMod(hh shr 4, (s.r * 0.7f).toInt()).toFloat() - s.r * 0.35f
+            drawRect(
+                color = Color.Black.copy(alpha = 0.30f),
+                topLeft = Offset(s.x + ox, s.y + oy),
+                size = Size(7f, 7f)
+            )
+        }
+    }
+
+    // Range ring: the squad's auto-fire radius around the formation
+    // centre, drawn under every entity.
+    if (world.members.isNotEmpty()) {
+        var ccx = 0f
+        var ccy = 0f
+        for (m in world.members) {
+            ccx += m.x
+            ccy += m.y
+        }
+        ccx /= world.members.size
+        ccy /= world.members.size
+        drawCircle(
+            color = Color.White.copy(alpha = 0.16f),
+            radius = 285f,
+            center = Offset(ccx, ccy),
+            style = Stroke(
+                width = 2f,
+                pathEffect = PathEffect.dashPathEffect(floatArrayOf(14f, 12f))
+            )
+        )
+    }
+
     // ---- Depth-sorted layer: towers, cover, crates, soldiers. ----
     // Sorted by base (feet) Y ascending: lower on screen draws later,
     // so it overlaps whatever stands higher up.
@@ -1632,12 +2174,24 @@ fun DrawScope.drawGame(
             distBetween(e.x, e.y, target.x, target.y) > 172f
         drawables.add(e.y to {
             drawStandingFigure(
-                e.x, e.y, eFacing, world.elapsed * 7f + e.phase, eMoving, art.enemy
+                e.x, e.y, eFacing, world.elapsed * 7f + e.phase, eMoving, art.enemy,
+                flash = e.flash > 0f
             )
             if (e.hp < e.maxHp) {
                 drawHealthBar(e.x, e.y - 108f, e.hp / e.maxHp, 34f)
             }
         })
+    }
+    for (d in world.deaths) {
+        drawables.add(d.y to {
+            drawStandingFigure(
+                d.x, d.y, d.facing, 0f, false, art.enemy,
+                alpha = (d.ttl / 0.25f).coerceIn(0f, 1f)
+            )
+        })
+    }
+    for (pk in world.pickups) {
+        drawables.add(pk.y + 2f to { drawPickup(art, pk, world.elapsed) })
     }
     val memberSet = if (faction == Faction.PAKISTAN) art.pak else art.ind
     val squadMoving = !holdOn && joyVec.getDistance() > 3f
@@ -1670,17 +2224,12 @@ fun DrawScope.drawGame(
     drawables.sortBy { it.first }
     for (d in drawables) d.second(this)
 
-    // ---- Effects on top, in pixel idiom: square-chain tracers at chest
-    // height, plus-shaped hit bursts, blocky blast ring. ----
+    // ---- Effects on top, in pixel idiom: plus-shaped muzzle / hit
+    // bursts and the blocky blast ring. (Tracers are gone — real
+    // bullets below carry the fire now.) ----
     for (fx in world.effects) {
         val a = (fx.ttl / fx.maxTtl).coerceIn(0f, 1f)
         when (fx.kind) {
-            FX_TRACER -> drawPixelTracer(
-                fx.x1, fx.y1, fx.x2, fx.y2, Color(0xFFFFEB3B), a
-            )
-            FX_ENEMY_TRACER -> drawPixelTracer(
-                fx.x1, fx.y1, fx.x2, fx.y2, Color(0xFFFF7043), a
-            )
             FX_HIT -> drawPixelBurst(fx.x1, fx.y1 - 55f, Color(0xFFFFF59D), a)
             FX_BLAST -> {
                 val progress = 1f - a
@@ -1690,15 +2239,51 @@ fun DrawScope.drawGame(
         }
     }
 
-    // Virtual joystick (bottom-left): base + knob.
-    val jc = Offset(w * 0.17f, h * 0.80f)
-    drawCircle(color = Color.White.copy(alpha = 0.16f), radius = 62f, center = jc)
-    drawCircle(
-        color = Color.White.copy(alpha = 0.45f),
-        radius = 62f,
-        center = jc,
-        style = Stroke(width = 2f)
-    )
-    val knob = jc + joyVec * 0.62f
-    drawCircle(color = Color.White.copy(alpha = 0.38f), radius = 26f, center = knob)
+    // ---- Particles: explosion sparks, lingering flames, foot dust. ----
+    for (p in world.particles) {
+        val frac = (p.ttl / p.maxTtl).coerceIn(0f, 1f)
+        when (p.kind) {
+            PT_FLAME -> {
+                val flicker = 0.75f + 0.25f *
+                    sin((world.elapsed * 40f + p.x).toDouble()).toFloat()
+                val s = p.size * flicker
+                drawRect(
+                    color = p.color.copy(alpha = frac * 0.9f),
+                    topLeft = Offset(p.x - s / 2f, p.y - s / 2f),
+                    size = Size(s, s)
+                )
+            }
+            PT_DUST -> drawRect(
+                color = p.color.copy(alpha = frac * 0.45f),
+                topLeft = Offset(p.x - p.size / 2f, p.y - p.size / 2f),
+                size = Size(p.size, p.size)
+            )
+            else -> drawRect(
+                color = p.color.copy(alpha = frac),
+                topLeft = Offset(p.x - p.size / 2f, p.y - p.size / 2f),
+                size = Size(p.size, p.size)
+            )
+        }
+    }
+
+    // ---- Bullets in flight, above the entities. ----
+    for (b in world.bullets) {
+        drawBullet(b)
+    }
+
+    // ---- Floating texts (damage numbers, pickup announcements). ----
+    for (f in world.floaters) {
+        val a = (f.ttl / f.maxTtl).coerceIn(0f, 1f)
+        drawCanvasText(f.text, f.x, f.y, f.size, f.argb, a)
+    }
+
+    // ---- Call-sign labels, drawn in the Canvas so they track the
+    // figures exactly (the old Compose overlay lagged behind). ----
+    for (m in world.members) {
+        if (m.down) {
+            drawCanvasText("DOWN", m.x, m.y - 30f, 30f, 0xFFFF5252.toInt())
+        } else {
+            drawCanvasText(m.name, m.x, m.y - 118f, 30f, 0xFFFFFFFF.toInt())
+        }
+    }
 }
