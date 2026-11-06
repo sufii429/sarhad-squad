@@ -1,6 +1,10 @@
 package app.sarhadsquad.android
 
 import android.os.Bundle
+import android.graphics.Bitmap
+import android.graphics.Canvas as NativeCanvas
+import android.graphics.Matrix
+import android.graphics.Paint
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
@@ -34,8 +38,13 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.layout.offset
@@ -44,6 +53,7 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.cos
@@ -54,7 +64,7 @@ import kotlin.math.sqrt
 import kotlin.random.Random
 
 // ============================================================================
-// Sarhad Squad: Border War — Mission 1 prototype (v0.3.0)
+// Sarhad Squad: Border War — Mission 1 prototype (v0.3.1)
 // Pixel-art squad shooter. TITLE -> GAME -> RESULT state machine.
 // All in-game text is English only.
 // ============================================================================
@@ -104,8 +114,8 @@ class Member(val name: String, val fireInterval: Float, val damage: Float) {
 class Enemy(val ax: Float, val ay: Float, val phase: Float) {
     var x = ax
     var y = ay
-    var hp = 34f
-    val maxHp = 34f
+    var hp = 48f
+    val maxHp = 48f
     var cd = 0f
     var alive = true
 }
@@ -438,6 +448,7 @@ fun ResultScreen(
 @Composable
 fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
     val world = remember { GameWorld() }
+    val art = remember { buildPixelArt() }
     var frameTick by remember { mutableIntStateOf(0) }
     var holdOn by remember { mutableStateOf(false) }
     var joyVec by remember { mutableStateOf(Offset.Zero) }
@@ -535,7 +546,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
                 if (d > 170f) moveEnemyToward(e, nearest.x, nearest.y, 58f, dt)
                 if (e.cd <= 0f && d <= 320f) {
                     e.cd = 0.9f
-                    nearest.hp -= 4f + Random.nextFloat() * 3f
+                    nearest.hp -= 5f + Random.nextFloat() * 3f
                     world.effects.add(
                         Effect(FX_ENEMY_TRACER, e.x, e.y, nearest.x, nearest.y, 0.08f, 0.08f)
                     )
@@ -668,7 +679,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
             // Reading frameTick here redraws the canvas every frame.
             val tick = frameTick
             if (tick >= 0 && world.initialized) {
-                drawGame(world, faction, joyVec, holdOn)
+                drawGame(world, faction, joyVec, holdOn, art)
             }
         }
 
@@ -683,7 +694,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.offset {
-                        IntOffset((m.x - 22f).toInt(), (m.y - 120f).toInt())
+                        IntOffset((m.x - 22f).toInt(), (m.y - 134f).toInt())
                     }
                 )
             }
@@ -752,9 +763,9 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
     }
 }
 
-// --- Canvas drawing (pixel-art rendering; gameplay coordinates unchanged) ---
+// --- Canvas drawing (pre-rendered pixel-art bitmaps; gameplay unchanged) ---
 
-/** Darken / lighten a colour by a factor (slab edges, side faces, shades). */
+/** Darken / lighten a colour by a factor (misc shades). */
 fun shadeOf(c: Color, f: Float): Color = Color(
     (c.red * f).coerceIn(0f, 1f),
     (c.green * f).coerceIn(0f, 1f),
@@ -762,362 +773,12 @@ fun shadeOf(c: Color, f: Float): Color = Color(
     c.alpha
 )
 
-// --- Pixel-art sprite system -------------------------------------------------
-// Sprites are string grids: one char per pixel, '.' is transparent. Every
-// palette carries a near-black outline colour ('K') so figures and props
-// pop against the ground, like the pixel-style target mockup.
-
-enum class PixelFacing { DOWN, UP, LEFT, RIGHT }
-
-fun DrawScope.drawPixelSprite(
-    rows: Array<String>,
-    palette: Map<Char, Color>,
-    left: Float,
-    top: Float,
-    pixel: Float,
-    alpha: Float = 1f
-) {
-    // The +0.7f overlap keeps scaled-up pixels free of hairline gaps.
-    val cell = Size(pixel + 0.7f, pixel + 0.7f)
-    for (r in rows.indices) {
-        val row = rows[r]
-        for (c in row.indices) {
-            val ch = row[c]
-            if (ch == '.' || ch == ' ') continue
-            val color = palette[ch] ?: continue
-            drawRect(
-                color = color.copy(alpha = color.alpha * alpha),
-                topLeft = Offset(left + c * pixel, top + r * pixel),
-                size = cell
-            )
-        }
-    }
-}
-
 /** Stable position hash: same tile, same pattern, every single frame. */
 fun pixelHash(ix: Int, iy: Int, seed: Int): Int {
     var n = ix * 374761393 + iy * 668265263 + seed * 362437
     n = (n xor (n shr 13)) * 1274126177
     return n xor (n shr 16)
 }
-
-// Soldier body rows (16x16) per facing; the two walk frames per facing
-// differ only in the four leg rows appended below the body.
-val SOLDIER_DOWN_BODY = arrayOf(
-    ".....KKKKKK.....",
-    "....KHHHHHHK....",
-    "...KHHhhhhHHK...",
-    "...KHHSSSSHHK...",
-    "....KSSSSSSK....",
-    "....KSSSSSSK....",
-    ".....KUUUUK.....",
-    "..KKUUUUUUUUKK..",
-    ".KUUUKUUUUUURK..",
-    ".KUUUUFFUUUURRK.",
-    ".KUUUUWWUUUURK..",
-    "..KUUUGGUUUUK...",
-    "..KUUUUUUUUUUK..",
-    "..KUUUUUUUUUUK..",
-    "...KUUUUUUUUK...",
-    "...KPPPPPPPPK..."
-)
-val SOLDIER_UP_BODY = arrayOf(
-    ".....KKKKKK.....",
-    "....KHHHHHHK....",
-    "...KHHHHHHHHK...",
-    "...KHHHHHHHHK...",
-    "....KHHHHHHK....",
-    ".....KUUUUK.....",
-    "..KKUUUUUUUUKR..",
-    ".KUUUUUUUUUUURK.",
-    ".KUUUuuuuUUURK..",
-    ".KUUUuuuuUUUUK..",
-    ".KUUUuuuuUUUUK..",
-    "..KUUUUUUUUUK...",
-    "..KUUUUUUUUUK...",
-    "...KUUUUUUUK....",
-    "...KUUUUUUUK....",
-    "...KPPPPPPPK...."
-)
-val SOLDIER_RIGHT_BODY = arrayOf(
-    "....KKKKKKK.....",
-    "...KHHHHHHHK....",
-    "...KHhhhhhHK....",
-    "...KHSSSSSH.....",
-    "....KSSSSSK.....",
-    ".....KUUUK......",
-    "....KUUUUUKKK...",
-    "....KUUUUUKRRRK.",
-    "....KUUFUUKRRRK.",
-    "....KUUGUUKRRRK.",
-    "....KUUUUUK.K...",
-    "....KUUUUUK.....",
-    "....KUUUUUK.....",
-    ".....KUUUK......",
-    ".....KPPPK......",
-    ".....KPPPK......"
-)
-val SOLDIER_LEGS_FRONT_A = arrayOf(
-    "...KPPP..PPPK...",
-    "...KPPP..PPPK...",
-    "...KPPP....PPK..",
-    "..KBBBK....KBBK."
-)
-val SOLDIER_LEGS_FRONT_B = arrayOf(
-    "...KPPP..PPPK...",
-    "....KPPK.KPPPK..",
-    "..KPPK....KPPP..",
-    ".KBBBK......KBBB"
-)
-val SOLDIER_LEGS_SIDE_A = arrayOf(
-    "....KPPK.KPPK...",
-    "....KPPK..KPPK..",
-    "...KPPPK...KPPK.",
-    "...KBBBK....KBBK"
-)
-val SOLDIER_LEGS_SIDE_B = arrayOf(
-    ".....KPPK.KPPK..",
-    "....KPPK.KPPK...",
-    "....KPPK....PPK.",
-    "....KBBK....KBBB"
-)
-val SOLDIER_DOWN_A = SOLDIER_DOWN_BODY + SOLDIER_LEGS_FRONT_A
-val SOLDIER_DOWN_B = SOLDIER_DOWN_BODY + SOLDIER_LEGS_FRONT_B
-val SOLDIER_UP_A = SOLDIER_UP_BODY + SOLDIER_LEGS_FRONT_A
-val SOLDIER_UP_B = SOLDIER_UP_BODY + SOLDIER_LEGS_FRONT_B
-val SOLDIER_RIGHT_A = SOLDIER_RIGHT_BODY + SOLDIER_LEGS_SIDE_A
-val SOLDIER_RIGHT_B = SOLDIER_RIGHT_BODY + SOLDIER_LEGS_SIDE_B
-val SOLDIER_LEFT_A = SOLDIER_RIGHT_A.map { it.reversed() }.toTypedArray()
-val SOLDIER_LEFT_B = SOLDIER_RIGHT_B.map { it.reversed() }.toTypedArray()
-
-fun soldierSprite(facing: PixelFacing, frame: Int): Array<String> = when (facing) {
-    PixelFacing.DOWN -> if (frame == 0) SOLDIER_DOWN_A else SOLDIER_DOWN_B
-    PixelFacing.UP -> if (frame == 0) SOLDIER_UP_A else SOLDIER_UP_B
-    PixelFacing.RIGHT -> if (frame == 0) SOLDIER_RIGHT_A else SOLDIER_RIGHT_B
-    PixelFacing.LEFT -> if (frame == 0) SOLDIER_LEFT_A else SOLDIER_LEFT_B
-}
-
-/** Palette swap on the shared soldier grids: role + faction decide colours. */
-fun soldierPalette(enemy: Boolean, faction: Faction?): Map<Char, Color> {
-    val outline = Color(0xFF0D120C)
-    val skin = Color(0xFFD89A62)
-    val boot = Color(0xFF17130F)
-    val rifle = Color(0xFF241A12)
-    if (enemy) {
-        return mapOf(
-            'K' to outline,
-            'H' to Color(0xFFD32F2F), // red headband
-            'h' to Color(0xFF8E1414),
-            'S' to skin,
-            'U' to Color(0xFF33373B), // charcoal clothes
-            'u' to Color(0xFF202327),
-            'P' to Color(0xFF17181A),
-            'B' to boot,
-            'R' to rifle,
-            'F' to Color(0xFFD32F2F),
-            'W' to Color(0xFF9E9E9E),
-            'G' to Color(0xFF33373B)
-        )
-    }
-    return when (faction) {
-        Faction.INDIA -> mapOf(
-            'K' to outline,
-            'H' to Color(0xFF4C522C),
-            'h' to Color(0xFF7A8152),
-            'S' to skin,
-            'U' to Color(0xFF6B7040), // olive-khaki uniform
-            'u' to Color(0xFF565C31),
-            'P' to Color(0xFF4F5433),
-            'B' to boot,
-            'R' to rifle,
-            'F' to Color(0xFFFF7A1A), // flag patch: saffron / white / green
-            'W' to Color.White,
-            'G' to Color(0xFF138808)
-        )
-        else -> mapOf( // PAKISTAN (and fallback)
-            'K' to outline,
-            'H' to Color(0xFF1F4420),
-            'h' to Color(0xFF40693A),
-            'S' to skin,
-            'U' to Color(0xFF2E5B27), // deep-green uniform
-            'u' to Color(0xFF22451D),
-            'P' to Color(0xFF24471F),
-            'B' to boot,
-            'R' to rifle,
-            'F' to Color(0xFF046A38), // flag patch: green + white
-            'W' to Color.White,
-            'G' to Color(0xFF046A38)
-        )
-    }
-}
-
-// Downed member: dedicated lying-flat sprite (20 wide x 10 tall), grey kit.
-val SOLDIER_DOWNED = arrayOf(
-    ".....KKKKKKKKKK.....",
-    "...KKGGGGGGGGGGKK...",
-    "..KGGKWWWWWWWWKGGK..",
-    "..KGGGGGGGGGGGGGGK..",
-    ".KGGKGGGGGGGGGGKGGK.",
-    ".KGGGGGGGGGGGGGGGGK.",
-    "..KGGGGGGGGGGGGGGK..",
-    "...KKGGGGGGGGGGKK...",
-    "....KBBK....KBBK....",
-    ".....KK......KK....."
-)
-val DOWNED_PALETTE = mapOf(
-    'K' to Color(0xFF14161A),
-    'G' to Color(0xFF8A8F8A),
-    'W' to Color(0xFFC9C9C9),
-    'B' to Color(0xFF2B2B2B)
-)
-
-// Wooden crate (18x18): planks, plank separators and an X brace.
-val PIXEL_CRATE = arrayOf(
-    "....KKKKKKKKKK....",
-    "..KKWWWWWWWWWWKK..",
-    ".KWWWKWWWWWWKWWWK.",
-    ".KWWWKWWWWWWKWWWK.",
-    ".KWWWKWWWWWWKWWWK.",
-    ".KWWWKWWXWWWKWWWK.",
-    ".KWWWKWWWXWWKWWWK.",
-    ".KWWWKWWWWXWKWWWK.",
-    ".KWWWKWWWWWXKWWWK.",
-    ".KWWWKWWWWXWKWWWK.",
-    ".KWWWKWWWXWWKWWWK.",
-    ".KWWWKWWXWWWKWWWK.",
-    ".KWWWKWWWWWWKWWWK.",
-    ".KDDDKDDDDDDKDDDK.",
-    ".KDDDKDDDDDDKDDDK.",
-    "..KKKKKKKKKKKKKK..",
-    "....KKKKKKKKKK....",
-    ".................."
-)
-val CRATE_PALETTE = mapOf(
-    'K' to Color(0xFF2A1A12),
-    'W' to Color(0xFFC08A4E),
-    'D' to Color(0xFF7C4A24),
-    'X' to Color(0xFF5D3520)
-)
-
-// Tree (20x24): three-shade canopy blob over a trunk.
-val PIXEL_TREE = arrayOf(
-    ".......KKKKKK.......",
-    ".....KKGGGGGGKK.....",
-    "....KGGLLGGGGLLGK...",
-    "...KGGGLLGGGGGLLGK..",
-    "..KGGGGLLGGGGGGLLK..",
-    "..KGLLGGGGLLGGGGGK..",
-    ".KGGGGLLGGGGGGLLGGK.",
-    ".KGLLGGGGGLLGGGGGGK.",
-    ".KGGGGGLLGGGGGLLGGK.",
-    "..KGGGGLLGGGGGGLLK..",
-    "..KGLLGGGGLLGGGGGK..",
-    "...KGGGGGLLGGGGGK...",
-    "...KGLLGGGGLLGGGK...",
-    "....KGGGGGGGGGGK....",
-    ".....KKKTTTTKKK.....",
-    ".......KTTTTK.......",
-    ".......KTTTTK.......",
-    ".......KTTTTK.......",
-    ".......KTTTTK.......",
-    ".......KTTTTK.......",
-    ".......KTTTTK.......",
-    ".......KTTTTK.......",
-    ".......KTTTTK.......",
-    ".....KKDDDDDDKK....."
-)
-val TREE_PALETTE = mapOf(
-    'K' to Color(0xFF10250F),
-    'G' to Color(0xFF2E7D32),
-    'L' to Color(0xFF66BB6A),
-    'T' to Color(0xFF6D4C41),
-    'D' to Color(0xFF4E342E)
-)
-
-// Rock (20x12): light top face over darker shaded faces.
-val PIXEL_ROCK = arrayOf(
-    ".......KKKKKK.......",
-    ".....KKLLLLLLKK.....",
-    "....KLLGGGGGGGGLK...",
-    "...KLLGGGGGGGGGGGGK.",
-    "..KLLGGGGGGGGGGGGGGK",
-    "..KGGGGGGGGGGGGGGGGK",
-    ".KGGGGGGGGGGGGGGGGGK",
-    ".KDDDDGGGGGGGGGGDDDK",
-    "..KDDDDDDDDDDDDDDK..",
-    "...KKDDDDDDDDDDKK...",
-    ".....KKKKKKKKKK.....",
-    "...................."
-)
-val ROCK_PALETTE = mapOf(
-    'K' to Color(0xFF202124),
-    'L' to Color(0xFFCFCFCF),
-    'G' to Color(0xFF9E9E9E),
-    'D' to Color(0xFF616161)
-)
-
-// Watchtower (34x46): roof + cabin + platform rows, then generated leg
-// rows with two crossing braces, then two base rows.
-val PIXEL_TOWER_TOP = arrayOf(
-    "............KKKKKKKKKK............",
-    "..........KKKKKKKKKKKKKK..........",
-    "........WWWWWWWWWWWWWWWWWW........",
-    "......WWWWWWWWWWWWWWWWWWWWWW......",
-    "....DDDDDDDDDDDDDDDDDDDDDDDDDD....",
-    "......KKWWWWWWWWWWWWWWWWWWKK......",
-    "......KWWWWWWWWWWWWWWWWWWWWK......",
-    "......KWWWWWDDDDDDDDDDWWWWWK......",
-    "......KWWWWWDDDDDDDDDDWWWWWK......",
-    "......KWWWWWDDDDDDDDDDWWWWWK......",
-    "......KWWWWWWWWWWWWWWWWWWWWK......",
-    "......KKKKKKKKKKKKKKKKKKKKKK......",
-    "....KKKKKKKKKKKKKKKKKKKKKKKKKK....",
-    "....KWWWWWWWWWWWWWWWWWWWWWWWWK....",
-    "....KKKKKKKKKKKKKKKKKKKKKKKKKK....",
-    "......KDDDDDDDDDDDDDDDDDDDDK......",
-    ".......KKKKKKKKKKKKKKKKKKKK.......",
-    "......KDDDDDDDDDDDDDDDDDDDDK......",
-    "......KKKKKKKKKKKKKKKKKKKKKK......",
-    "....KKKKKKKKKKKKKKKKKKKKKKKKKK...."
-)
-val PIXEL_TOWER = PIXEL_TOWER_TOP + Array(24) { row ->
-    val chars = CharArray(34) { '.' }
-    chars[6] = 'K'; chars[7] = 'K'; chars[26] = 'K'; chars[27] = 'K'
-    val braceA = 8 + (row * 17) / 23
-    chars[braceA] = 'K'; chars[braceA + 1] = 'K'
-    val braceB = 25 - (row * 17) / 23
-    chars[braceB] = 'K'; chars[braceB + 1] = 'K'
-    String(chars)
-} + arrayOf(
-    "......KK..................KK......",
-    ".....KKKK................KKKK....."
-)
-val TOWER_PALETTE = mapOf(
-    'K' to Color(0xFF20140D),
-    'W' to Color(0xFFA9743F),
-    'D' to Color(0xFF4A2E1B)
-)
-
-// Tiny 3x3 ground tufts, stamped in tiled rows across the plots.
-val PIXEL_TUFT = arrayOf(
-    "a.a",
-    "aba",
-    "..."
-)
-val PIXEL_WHEAT = arrayOf(
-    ".a.",
-    "aba",
-    "a.a"
-)
-
-fun DrawScope.drawPixelPattern(
-    rows: Array<String>,
-    palette: Map<Char, Color>,
-    left: Float,
-    top: Float,
-    pixel: Float
-) = drawPixelSprite(rows, palette, left, top, pixel)
-
 
 fun DrawScope.drawHealthBar(cx: Float, topY: Float, frac: Float, width: Float = 40f) {
     val f = frac.coerceIn(0f, 1f)
@@ -1142,16 +803,6 @@ fun DrawScope.drawShadow(cx: Float, cy: Float, rx: Float, ry: Float) {
     )
 }
 
-/** Fill a simple polygon from a list of points. */
-fun DrawScope.fillPolygon(points: List<Offset>, color: Color) {
-    if (points.size < 3) return
-    val path = Path()
-    path.moveTo(points[0].x, points[0].y)
-    for (i in 1 until points.size) path.lineTo(points[i].x, points[i].y)
-    path.close()
-    drawPath(path, color)
-}
-
 /** Unit facing vector from (x, y) toward (tx, ty), with a fallback. */
 fun facingToward(x: Float, y: Float, tx: Float, ty: Float, fallback: Offset): Offset {
     val d = distBetween(x, y, tx, ty)
@@ -1159,159 +810,631 @@ fun facingToward(x: Float, y: Float, tx: Float, ty: Float, fallback: Offset): Of
     return Offset((tx - x) / d, (ty - y) / d)
 }
 
+// --- Pre-rendered pixel art --------------------------------------------------
+// Per the pixel-art-game-sprites skill: every tile and sprite is painted
+// ONCE into a Bitmap at native pixel resolution (buildPixelArt, remembered
+// in GameScreen) and blitted per frame with FilterQuality.None, so the
+// texture can be fully dense without per-frame rect cost, and pixels stay
+// chunky-crisp when scaled up.
+
+enum class PixelFacing { DOWN, UP, LEFT, RIGHT }
+
+private fun argb(hex: Long): Int = hex.toInt()
+
+private class PxPainter(val canvas: NativeCanvas, val paint: Paint) {
+    fun rect(x: Int, y: Int, w: Int, h: Int, color: Int) {
+        if (w <= 0 || h <= 0) return
+        paint.color = color
+        canvas.drawRect(
+            x.toFloat(), y.toFloat(), (x + w).toFloat(), (y + h).toFloat(), paint
+        )
+    }
+
+    fun px(x: Int, y: Int, color: Int) = rect(x, y, 1, 1, color)
+}
+
+private fun pixelBitmap(w: Int, h: Int, block: (PxPainter) -> Unit): ImageBitmap {
+    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    val canvas = NativeCanvas(bmp)
+    val paint = Paint().apply {
+        isAntiAlias = false
+        style = Paint.Style.FILL
+    }
+    block(PxPainter(canvas, paint))
+    return bmp.asImageBitmap()
+}
+
+private fun mirrorBitmap(src: ImageBitmap): ImageBitmap {
+    val b = src.asAndroidBitmap()
+    val m = Matrix()
+    m.preScale(-1f, 1f)
+    return Bitmap.createBitmap(b, 0, 0, b.width, b.height, m, false).asImageBitmap()
+}
+
+// Shared sprite colours.
+private val PX_OUTLINE = argb(0xFF0B0F0A)
+private val PX_SKIN = argb(0xFFE0A266)
+private val PX_SKIN_SHADE = argb(0xFFB97F45)
+private val PX_BOOT = argb(0xFF17130F)
+private val PX_RIFLE = argb(0xFF2A2018)
+private val PX_RIFLE_METAL = argb(0xFF555B60)
+private val PX_BAND = argb(0xFFD43A2E)
+private val PX_BAND_DARK = argb(0xFF9E241B)
+private val PX_HAIR = argb(0xFF1C1C1E)
+private val PX_BELT = argb(0xFF1E1A14)
+
+/** Soldier palette: faction / role variants come from palette swap only. */
+private class SoldierPal(
+    val uniform: Int,
+    val uniformLight: Int,
+    val uniformDark: Int,
+    val helmet: Int,
+    val helmetLight: Int,
+    val pants: Int,
+    val pack: Int,
+    val headband: Boolean
+)
+
+// PAKISTAN: bright-mid green uniform, highlight green, dark green helmet.
+private val PAL_PAK = SoldierPal(
+    argb(0xFF3E7A33), argb(0xFF5FA24A), argb(0xFF2A5A24),
+    argb(0xFF24511F), argb(0xFF4C7A3F), argb(0xFF2F6129), argb(0xFF28511F), false
+)
+
+// INDIA: bright olive-khaki equivalents.
+private val PAL_IND = SoldierPal(
+    argb(0xFF97954F), argb(0xFFB5B06A), argb(0xFF6E6C36),
+    argb(0xFF5E5C2C), argb(0xFF8A884E), argb(0xFF74723C), argb(0xFF605E30), false
+)
+
+// ENEMY: charcoal clothes, lighter grey highlights, red headband.
+private val PAL_ENEMY = SoldierPal(
+    argb(0xFF43484D), argb(0xFF62686E), argb(0xFF2C3034),
+    argb(0xFF3A3F44), argb(0xFF62686E), argb(0xFF232629), argb(0xFF2C3034), true
+)
+
 /**
- * One field plot in pixel style, inside the same rectangle the v0.2.0
- * layout used: blocky shaded edges, then tiled pixel texture — crop tuft
- * clusters for green plots, wheat tufts for the golden plot, sparse
- * hashed speckles for the plain plot. Hashing is position-based, so the
- * texture is identical every frame (no flicker).
+ * Soldier sprite, native 24x30, painted programmatically: shared body
+ * parts with alternate leg/boot rows for the two walk frames. LEFT is
+ * the RIGHT bitmap mirrored at build time.
  */
-fun DrawScope.drawFieldPlot(x0: Float, y0: Float, x1: Float, y1: Float, color: Color) {
-    val wheat = color == Color(0xFFC0CA33)
-    val plain = color == Color(0xFFAED581)
-    val base = if (wheat) Color(0xFFE0AC4C) else color
-    val seedX = (x0 / 10f).toInt()
-    val seedY = (y0 / 10f).toInt()
-    // Blocky slab edges: darker bottom + right strips, lighter top strip.
-    drawRect(
-        color = shadeOf(base, 0.60f),
-        topLeft = Offset(x0, y1),
-        size = Size(x1 - x0, 7f)
-    )
-    drawRect(
-        color = shadeOf(base, 0.72f),
-        topLeft = Offset(x1, y0),
-        size = Size(5f, y1 - y0 + 7f)
-    )
-    drawRect(color = base, topLeft = Offset(x0, y0), size = Size(x1 - x0, y1 - y0))
-    drawRect(
-        color = shadeOf(base, 1.10f).copy(alpha = 0.45f),
-        topLeft = Offset(x0, y0),
-        size = Size(x1 - x0, 4f)
-    )
-    if (wheat) {
-        // Wheat: rows of golden tuft clusters + single stalk pixels.
-        val tuftPalette = mapOf(
-            'a' to Color(0xFFB97F26),
-            'b' to Color(0xFFFFD968)
-        )
-        var ty = y0 + 8f
-        var row = 0
-        while (ty < y1 - 14f) {
-            var tx = x0 + 8f + (row % 2) * 13f
-            while (tx < x1 - 14f) {
-                val hx = (tx / 10f).toInt()
-                val hy = (ty / 10f).toInt()
-                if (kotlin.math.abs(pixelHash(hx, hy, seedX + seedY) % 5) >= 2) {
-                    drawPixelPattern(PIXEL_WHEAT, tuftPalette, tx, ty, 3f)
-                }
-                if (pixelHash(hx, hy, seedX * 3 + 7) % 4 == 0) {
-                    drawRect(
-                        color = Color(0xFFC98F2E),
-                        topLeft = Offset(tx + 16f, ty + 2f),
-                        size = Size(3f, 8f)
-                    )
-                }
-                tx += 36f
+private fun paintSoldier(
+    pal: SoldierPal,
+    facing: PixelFacing,
+    frame: Int,
+    faction: Faction?
+): ImageBitmap = pixelBitmap(24, 30) { p ->
+    when (facing) {
+        PixelFacing.DOWN, PixelFacing.UP -> {
+            // Legs + boots: frame B strides (one foot forward, one lifted).
+            if (frame == 0) {
+                p.rect(7, 22, 4, 6, pal.pants); p.rect(13, 22, 4, 6, pal.pants)
+                p.rect(6, 28, 5, 2, PX_BOOT); p.rect(13, 28, 5, 2, PX_BOOT)
+            } else {
+                p.rect(6, 22, 4, 6, pal.pants); p.rect(14, 22, 4, 5, pal.pants)
+                p.rect(4, 28, 6, 2, PX_BOOT); p.rect(14, 26, 5, 2, PX_BOOT)
             }
-            ty += 32f
-            row++
+            // Torso.
+            p.rect(6, 12, 12, 9, pal.uniform)
+            p.rect(6, 12, 12, 1, pal.uniformLight)
+            // Arms + hands.
+            p.rect(4, 12, 3, 8, pal.uniformDark); p.rect(17, 12, 3, 8, pal.uniformDark)
+            p.rect(4, 20, 3, 2, PX_SKIN); p.rect(17, 20, 3, 2, PX_SKIN)
+            p.rect(6, 21, 12, 1, PX_BELT)
+            if (facing == PixelFacing.DOWN) {
+                // Vest with pocket shading + flag patch on the chest.
+                p.rect(8, 13, 8, 7, pal.uniformDark)
+                p.rect(9, 17, 2, 2, pal.uniform); p.rect(13, 17, 2, 2, pal.uniform)
+                when (faction) {
+                    Faction.PAKISTAN -> {
+                        p.rect(9, 13, 3, 2, argb(0xFF046A38))
+                        p.rect(9, 13, 1, 2, argb(0xFFFFFFFF))
+                    }
+                    Faction.INDIA -> {
+                        p.rect(9, 13, 3, 1, argb(0xFFFF7A1A))
+                        p.rect(9, 14, 3, 1, argb(0xFFFFFFFF))
+                        p.rect(9, 15, 3, 1, argb(0xFF138808))
+                    }
+                    else -> {}
+                }
+                if (pal.headband) p.rect(4, 13, 3, 2, PX_BAND) // enemy armband
+                // Rifle angled down the right side.
+                p.rect(18, 15, 2, 3, PX_RIFLE); p.rect(19, 18, 2, 3, PX_RIFLE)
+                p.rect(20, 21, 2, 2, PX_RIFLE_METAL)
+                // Face.
+                p.rect(8, 7, 8, 4, PX_SKIN)
+                p.px(10, 8, PX_OUTLINE); p.px(13, 8, PX_OUTLINE)
+                p.rect(8, 10, 8, 1, PX_SKIN_SHADE)
+            } else {
+                // Back: backpack with flap + slung rifle.
+                p.rect(7, 12, 10, 9, pal.pack)
+                p.rect(7, 12, 10, 2, pal.uniformDark)
+                p.rect(9, 16, 6, 4, pal.uniformDark)
+                p.rect(17, 13, 2, 3, PX_RIFLE); p.rect(18, 16, 2, 3, PX_RIFLE)
+                p.rect(19, 19, 2, 2, PX_RIFLE_METAL)
+                // Back of the helmet, down to the neck.
+                p.rect(7, 8, 10, 3, pal.helmet)
+                p.rect(10, 11, 4, 1, PX_SKIN_SHADE)
+            }
+            // Head: helmet dome + shine + brim, or hair + red headband.
+            if (pal.headband) {
+                p.rect(6, 2, 12, 3, PX_HAIR)
+                p.rect(5, 5, 14, 2, PX_BAND)
+                p.rect(18, 6, 2, 2, PX_BAND_DARK)
+            } else {
+                p.rect(6, 2, 12, 3, pal.helmet)
+                p.rect(7, 2, 4, 1, pal.helmetLight)
+                p.rect(5, 5, 14, 1, pal.helmet)
+                p.rect(4, 6, 16, 1, pal.uniformDark)
+            }
         }
-    } else if (plain) {
-        // Plain plot: sparse darker / lighter pixel speckles only.
-        var ty = y0 + 7f
-        while (ty < y1 - 7f) {
-            var tx = x0 + 7f
-            while (tx < x1 - 7f) {
-                val hsh = pixelHash((tx / 8f).toInt(), (ty / 8f).toInt(), seedX + seedY * 5)
-                if (hsh % 5 == 0) {
-                    drawRect(
-                        color = shadeOf(base, if (hsh % 10 == 0) 1.12f else 0.84f),
-                        topLeft = Offset(tx, ty),
-                        size = Size(4.5f, 4.5f)
-                    )
-                }
-                tx += 19f
+        PixelFacing.RIGHT -> {
+            // Side legs: frame B strides forward / lifts the back foot.
+            if (frame == 0) {
+                p.rect(9, 22, 4, 6, pal.pants); p.rect(8, 28, 6, 2, PX_BOOT)
+                p.rect(14, 22, 4, 6, pal.pants); p.rect(14, 28, 6, 2, PX_BOOT)
+            } else {
+                p.rect(13, 22, 4, 6, pal.pants); p.rect(14, 28, 6, 2, PX_BOOT)
+                p.rect(6, 22, 4, 5, pal.pants); p.rect(4, 26, 6, 2, PX_BOOT)
             }
-            ty += 19f
+            // Torso in profile + backpack bump behind.
+            p.rect(8, 12, 8, 9, pal.uniform)
+            p.rect(8, 12, 8, 1, pal.uniformLight)
+            p.rect(10, 13, 5, 7, pal.uniformDark)
+            p.rect(5, 12, 3, 8, pal.pack)
+            p.rect(8, 21, 8, 1, PX_BELT)
+            // Arm reaching to the rifle + horizontal rifle.
+            p.rect(14, 13, 3, 5, pal.uniformDark)
+            p.rect(15, 18, 2, 2, PX_SKIN)
+            p.rect(11, 15, 12, 2, PX_RIFLE)
+            p.rect(21, 15, 3, 1, PX_RIFLE_METAL)
+            p.rect(9, 14, 3, 3, PX_RIFLE)
+            // Head in profile: face front, helmet / headband above.
+            p.rect(12, 7, 5, 4, PX_SKIN)
+            p.px(15, 8, PX_OUTLINE)
+            p.rect(7, 5, 4, 3, if (pal.headband) PX_HAIR else pal.helmet)
+            if (pal.headband) {
+                p.rect(7, 2, 10, 3, PX_HAIR)
+                p.rect(6, 5, 13, 2, PX_BAND)
+            } else {
+                p.rect(7, 2, 10, 3, pal.helmet)
+                p.rect(8, 2, 3, 1, pal.helmetLight)
+                p.rect(15, 5, 5, 1, pal.helmet)
+            }
         }
-    } else {
-        // Crop plot: rows of small 3-shade plant clusters + row dashes.
-        val tuftPalette = mapOf(
-            'a' to shadeOf(base, 0.70f),
-            'b' to shadeOf(base, 1.16f)
-        )
-        var ty = y0 + 8f
-        var row = 0
-        while (ty < y1 - 14f) {
-            var tx = x0 + 8f + (row % 2) * 13f
-            while (tx < x1 - 14f) {
-                val hx = (tx / 10f).toInt()
-                val hy = (ty / 10f).toInt()
-                if (kotlin.math.abs(pixelHash(hx, hy, seedX - seedY) % 5) >= 2) {
-                    drawPixelPattern(PIXEL_TUFT, tuftPalette, tx, ty, 3f)
-                }
-                tx += 36f
-            }
-            ty += 32f
-            row++
+        PixelFacing.LEFT -> {
+            // Never painted directly: LEFT reuses the mirrored RIGHT bitmap.
+            p.rect(0, 0, 1, 1, PX_OUTLINE)
         }
     }
 }
 
-/** Watchtower as a pixel sprite (34x46 grid at 2.5px per pixel). */
-fun DrawScope.drawWatchtower(cx: Float, baseY: Float) {
-    drawShadow(cx, baseY + 4f, 42f, 7f)
-    val px = 2.5f
-    drawPixelSprite(PIXEL_TOWER, TOWER_PALETTE, cx - 17f * px, baseY - 46f * px, px)
+/** Downed soldier: lying figure, grey palette, native 28x13. */
+private fun paintDowned(): ImageBitmap = pixelBitmap(28, 13) { p ->
+    p.rect(1, 3, 26, 8, PX_OUTLINE)
+    p.rect(2, 4, 6, 6, argb(0xFF6E726E))
+    p.rect(2, 4, 6, 1, argb(0xFFA9ADA9))
+    p.rect(8, 5, 3, 4, PX_SKIN_SHADE)
+    p.rect(11, 4, 10, 6, argb(0xFF8A8F8A))
+    p.rect(11, 4, 10, 1, argb(0xFFA9ADA9))
+    p.rect(14, 6, 4, 3, argb(0xFF6E726E))
+    p.rect(12, 10, 7, 1, argb(0xFF6E726E))
+    p.rect(21, 5, 5, 4, argb(0xFF747874))
+    p.rect(26, 4, 2, 3, PX_BOOT); p.rect(26, 8, 2, 3, PX_BOOT)
 }
 
-/** Tree as a pixel sprite (20x24 grid at 3px per pixel). */
-fun DrawScope.drawTree(o: Obstacle) {
+/** Wooden crate, native 24x24: planks, X brace, top highlight. */
+private fun paintCrate(): ImageBitmap = pixelBitmap(24, 24) { p ->
+    val wood = argb(0xFFC08A4E)
+    val light = argb(0xFFE0AA6A)
+    val dark = argb(0xFF7C4A24)
+    val brace = argb(0xFF5D3520)
+    p.rect(0, 0, 24, 24, PX_OUTLINE)
+    p.rect(1, 1, 22, 22, wood)
+    p.rect(1, 1, 22, 2, light)
+    p.rect(1, 19, 22, 4, dark)
+    p.rect(1, 8, 22, 1, dark); p.rect(1, 15, 22, 1, dark)
+    for (i in 0 until 18) {
+        p.rect(3 + i, 3 + i, 2, 2, brace)
+        p.rect(3 + i, 20 - i, 2, 2, brace)
+    }
+    p.px(2, 2, light); p.px(21, 2, light)
+}
+
+/** Tree, native 26x32: layered 3-shade canopy over a trunk. */
+private fun paintTree(): ImageBitmap = pixelBitmap(26, 32) { p ->
+    val dark = argb(0xFF1E5B24)
+    val mid = argb(0xFF2E7D32)
+    val light = argb(0xFF66BB6A)
+    val hi = argb(0xFF8FD07A)
+    p.rect(11, 23, 4, 8, argb(0xFF6D4C41))
+    p.rect(11, 23, 1, 8, argb(0xFF4E342E))
+    p.rect(9, 30, 8, 1, argb(0xFF4E342E))
+    val rows = listOf(
+        3 to 3, 4 to 5, 5 to 7, 6 to 9, 7 to 10, 8 to 11, 9 to 12, 10 to 12,
+        11 to 12, 12 to 12, 13 to 11, 14 to 11, 15 to 10, 16 to 10, 17 to 9,
+        18 to 8, 19 to 7, 20 to 6, 21 to 4
+    )
+    for ((y, hw) in rows) p.rect(13 - hw, y, hw * 2, 1, dark)
+    for ((y, hw) in rows) {
+        if (y in 5..19 && hw > 2) p.rect(13 - hw + 2, y, (hw - 2) * 2, 1, mid)
+    }
+    for (y in 4..20) {
+        for (x in 3..22) {
+            val hh = pixelHash(x, y, 77)
+            if (Math.floorMod(hh, 7) == 0) p.px(x, y, light)
+            if (Math.floorMod(hh, 23) == 0) p.px(x, y, hi)
+        }
+    }
+}
+
+/** Rock, native 24x14: light top face over shaded sides. */
+private fun paintRock(): ImageBitmap = pixelBitmap(24, 14) { p ->
+    val rows = listOf(
+        2 to 5, 3 to 8, 4 to 10, 5 to 11, 6 to 11,
+        7 to 11, 8 to 10, 9 to 9, 10 to 7, 11 to 5
+    )
+    for ((y, hw) in rows) {
+        val col = when {
+            y <= 4 -> argb(0xFFCFCFCF)
+            y <= 7 -> argb(0xFF9E9E9E)
+            else -> argb(0xFF616161)
+        }
+        p.rect(12 - hw, y, hw * 2, 1, col)
+        p.px(12 - hw, y, PX_OUTLINE); p.px(12 + hw - 1, y, PX_OUTLINE)
+    }
+    p.rect(8, 3, 5, 1, argb(0xFFEDEDED))
+}
+
+/** Watchtower, native 40x56: legs + X braces, cabin, shaded roof. */
+private fun paintTower(): ImageBitmap = pixelBitmap(40, 56) { p ->
+    val woodL = argb(0xFFA9743F)
+    val woodM = argb(0xFF7C4A24)
+    val woodD = argb(0xFF4A2E1B)
+    // Legs + feet.
+    p.rect(9, 22, 3, 32, woodM); p.rect(28, 22, 3, 32, woodM)
+    p.rect(9, 22, 1, 32, woodD); p.rect(30, 22, 1, 32, woodD)
+    p.rect(7, 54, 8, 2, woodD); p.rect(25, 54, 8, 2, woodD)
+    // X braces, stepped diagonals between the legs.
+    for (i in 0 until 16) {
+        val by = 24 + (i * 26) / 16
+        p.rect(12 + i, by, 2, 2, woodD)
+        p.rect(26 - i, by, 2, 2, woodD)
+    }
+    // Platform.
+    p.rect(6, 20, 28, 3, woodD)
+    p.rect(6, 20, 28, 1, woodL)
+    // Cabin with a dark window.
+    p.rect(8, 8, 24, 12, woodM)
+    p.rect(8, 8, 24, 2, woodL)
+    p.rect(8, 17, 24, 3, woodD)
+    p.rect(8, 8, 1, 12, woodD); p.rect(31, 8, 1, 12, woodD)
+    p.rect(15, 11, 10, 6, argb(0xFF14181D))
+    p.px(17, 12, argb(0xFF90CAF9))
+    // Roof: widening shingle rows + ridge highlight.
+    val roofRows = listOf(1 to 5, 2 to 8, 3 to 11, 4 to 13, 5 to 15, 6 to 16, 7 to 17)
+    for ((y, hw) in roofRows) p.rect(20 - hw, y, hw * 2, 1, woodD)
+    p.rect(15, 1, 10, 1, woodL)
+    p.rect(3, 7, 34, 1, PX_OUTLINE)
+}
+
+/** Dirt base tile, native 64x64: speckled brown with worn streaks. */
+private fun paintDirt(): ImageBitmap = pixelBitmap(64, 64) { p ->
+    val base = argb(0xFF9C7B4F)
+    val dark = argb(0xFF8A6A42)
+    val light = argb(0xFFB08D5E)
+    val pebble = argb(0xFF7D7468)
+    val grass = argb(0xFF6F8F3F)
+    p.rect(0, 0, 64, 64, base)
+    for (y in 0 until 64) {
+        for (x in 0 until 64) {
+            val hh = pixelHash(x, y, 99)
+            when {
+                Math.floorMod(hh, 29) == 0 -> p.px(x, y, pebble)
+                Math.floorMod(hh, 11) == 0 -> p.px(x, y, dark)
+                Math.floorMod(hh, 13) == 0 -> p.px(x, y, light)
+                Math.floorMod(hh, 37) == 0 -> p.px(x, y, grass)
+            }
+        }
+    }
+    var sx = 4
+    while (sx < 60) {
+        p.rect(sx, 20, 5, 1, dark)
+        p.rect(sx + 3, 44, 5, 1, dark)
+        sx += 9
+    }
+}
+
+/**
+ * Crop tile, native 64x64, FULL coverage: soil gaps between vertical
+ * crop bands, tuft clusters in the band, vertical shading gradient
+ * (bands darker toward the bottom) and a light top edge.
+ */
+private fun paintCrop(
+    dark: Int, mid: Int, light: Int, hi: Int, seed: Int, sparse: Boolean
+): ImageBitmap = pixelBitmap(64, 64) { p ->
+    p.rect(0, 0, 64, 64, argb(0xFF6E5133))
+    var bx = 0
+    while (bx < 64) {
+        for (y in 0 until 64) {
+            p.rect(bx, y, 8, 1, if (y < 26) mid else dark)
+        }
+        var ty = Math.floorMod(bx * 7 + seed, 5)
+        while (ty < 61) {
+            if (!sparse || Math.floorMod(pixelHash(bx, ty, seed), 3) != 0) {
+                p.rect(bx + 1, ty, 6, 2, light)
+                p.rect(bx + 2, ty, 2, 1, hi)
+                p.rect(bx + 5, ty + 1, 2, 1, hi)
+            }
+            ty += 6
+        }
+        bx += 11
+    }
+    p.rect(0, 0, 64, 1, light)
+}
+
+/** Wheat tile, native 64x64: dense stalk columns + grain-head clusters. */
+private fun paintWheat(seed: Int): ImageBitmap = pixelBitmap(64, 64) { p ->
+    val base = argb(0xFFD9A83F)
+    val dark = argb(0xFFB9852B)
+    val stalk = argb(0xFFC9972F)
+    val head = argb(0xFFF5D76A)
+    val hi = argb(0xFFFFF0A0)
+    p.rect(0, 0, 64, 64, base)
+    p.rect(0, 56, 64, 8, dark)
+    var sx = 1
+    while (sx < 64) {
+        p.rect(sx, 0, 1, 64, stalk)
+        sx += 3
+    }
+    var gy = 2
+    while (gy < 62) {
+        var gx = 0
+        while (gx < 63) {
+            val hh = pixelHash(gx, gy, seed)
+            if (Math.floorMod(hh, 5) != 0) {
+                p.rect(gx, gy, 2, 3, head)
+                p.px(gx, gy, hi)
+            }
+            gx += 4
+        }
+        gy += 8
+    }
+    p.rect(0, 0, 64, 1, hi)
+}
+
+/** Canal strip tile, native 27x64: mud banks, shaded water, sparkles. */
+private fun paintCanal(variant: Int): ImageBitmap = pixelBitmap(27, 64) { p ->
+    val bankD = argb(0xFF5D4630)
+    val bankL = argb(0xFF7A5C3E)
+    val water = argb(0xFF2E7CD6)
+    val waterL = argb(0xFF4A97E8)
+    val waterD = argb(0xFF1F66B4)
+    p.rect(0, 0, 4, 64, bankD); p.rect(23, 0, 4, 64, bankD)
+    p.rect(3, 0, 1, 64, bankL); p.rect(23, 0, 1, 64, bankL)
+    p.rect(4, 0, 19, 64, water)
+    for (y in 0 until 64) {
+        for (x in 5 until 22) {
+            val hh = pixelHash(x, y, 500 + variant)
+            if (Math.floorMod(hh, 17) == 0) p.px(x, y, waterL)
+            if (Math.floorMod(hh, 23) == 0) p.px(x, y, waterD)
+        }
+    }
+    val sparkles = if (variant == 0) listOf(11 to 12, 16 to 40) else listOf(15 to 24, 10 to 52)
+    val wht = argb(0xFFFFFFFF)
+    for ((sx, sy) in sparkles) {
+        p.px(sx, sy, wht)
+        p.px(sx - 1, sy, wht); p.px(sx + 1, sy, wht)
+        p.px(sx, sy - 1, wht); p.px(sx, sy + 1, wht)
+    }
+}
+
+/** Road strip tile, native 64x16: speckles + two dashed track lines. */
+private fun paintRoad(): ImageBitmap = pixelBitmap(64, 16) { p ->
+    val base = argb(0xFFB08968)
+    val dark = argb(0xFF8A6A42)
+    val light = argb(0xFFC49B78)
+    p.rect(0, 0, 64, 16, base)
+    for (y in 0 until 16) {
+        for (x in 0 until 64) {
+            val hh = pixelHash(x, y, 41)
+            if (Math.floorMod(hh, 9) == 0) p.px(x, y, dark)
+            if (Math.floorMod(hh, 13) == 0) p.px(x, y, light)
+        }
+    }
+    var x = 0
+    while (x < 64) {
+        p.rect(x, 4, 9, 2, dark)
+        p.rect(x + 4, 11, 9, 2, dark)
+        x += 16
+    }
+    p.rect(0, 15, 64, 1, dark)
+}
+
+/** Fence segment, native 16x12: one post + two dashed wire rows. */
+private fun paintFence(): ImageBitmap = pixelBitmap(16, 12) { p ->
+    val post = argb(0xFF3A3F44)
+    val postL = argb(0xFF5A6167)
+    val wire = argb(0xFF2E3338)
+    p.rect(1, 0, 3, 12, post)
+    p.rect(1, 0, 1, 12, postL)
+    for (x in 0 until 16) {
+        if (x % 6 != 5) {
+            p.px(x, 3, wire)
+            p.px(x, 7, wire)
+        }
+    }
+    p.px(6, 2, wire); p.px(12, 6, wire)
+}
+
+/** All pre-rendered art for the game screen. Built once, remembered. */
+class PixelArt(
+    val dirt: ImageBitmap,
+    val cropA: ImageBitmap,
+    val cropB: ImageBitmap,
+    val lightA: ImageBitmap,
+    val lightB: ImageBitmap,
+    val wheatA: ImageBitmap,
+    val wheatB: ImageBitmap,
+    val canalA: ImageBitmap,
+    val canalB: ImageBitmap,
+    val road: ImageBitmap,
+    val fence: ImageBitmap,
+    val pak: Map<PixelFacing, Array<ImageBitmap>>,
+    val ind: Map<PixelFacing, Array<ImageBitmap>>,
+    val enemy: Map<PixelFacing, Array<ImageBitmap>>,
+    val downed: ImageBitmap,
+    val crate: ImageBitmap,
+    val tree: ImageBitmap,
+    val rock: ImageBitmap,
+    val tower: ImageBitmap
+)
+
+fun buildPixelArt(): PixelArt {
+    fun soldierSet(
+        pal: SoldierPal,
+        faction: Faction?
+    ): Map<PixelFacing, Array<ImageBitmap>> {
+        val down = arrayOf(
+            paintSoldier(pal, PixelFacing.DOWN, 0, faction),
+            paintSoldier(pal, PixelFacing.DOWN, 1, faction)
+        )
+        val up = arrayOf(
+            paintSoldier(pal, PixelFacing.UP, 0, faction),
+            paintSoldier(pal, PixelFacing.UP, 1, faction)
+        )
+        val right = arrayOf(
+            paintSoldier(pal, PixelFacing.RIGHT, 0, faction),
+            paintSoldier(pal, PixelFacing.RIGHT, 1, faction)
+        )
+        val left = arrayOf(mirrorBitmap(right[0]), mirrorBitmap(right[1]))
+        return mapOf(
+            PixelFacing.DOWN to down,
+            PixelFacing.UP to up,
+            PixelFacing.RIGHT to right,
+            PixelFacing.LEFT to left
+        )
+    }
+    return PixelArt(
+        dirt = paintDirt(),
+        cropA = paintCrop(
+            argb(0xFF2F7A26), argb(0xFF43A832), argb(0xFF6FC84F), argb(0xFF9BE36D),
+            seed = 11, sparse = false
+        ),
+        cropB = paintCrop(
+            argb(0xFF2F7A26), argb(0xFF43A832), argb(0xFF6FC84F), argb(0xFF9BE36D),
+            seed = 47, sparse = false
+        ),
+        lightA = paintCrop(
+            argb(0xFF57A03A), argb(0xFF79BC52), argb(0xFFA5D96E), argb(0xFFC4EC8F),
+            seed = 23, sparse = true
+        ),
+        lightB = paintCrop(
+            argb(0xFF57A03A), argb(0xFF79BC52), argb(0xFFA5D96E), argb(0xFFC4EC8F),
+            seed = 35, sparse = true
+        ),
+        wheatA = paintWheat(5),
+        wheatB = paintWheat(19),
+        canalA = paintCanal(0),
+        canalB = paintCanal(1),
+        road = paintRoad(),
+        fence = paintFence(),
+        pak = soldierSet(PAL_PAK, Faction.PAKISTAN),
+        ind = soldierSet(PAL_IND, Faction.INDIA),
+        enemy = soldierSet(PAL_ENEMY, null),
+        downed = paintDowned(),
+        crate = paintCrate(),
+        tree = paintTree(),
+        rock = paintRock(),
+        tower = paintTower()
+    )
+}
+
+// --- Sprite blitting (FilterQuality.None keeps the pixels chunky) -----------
+
+private fun DrawScope.blit(
+    bmp: ImageBitmap,
+    left: Float,
+    top: Float,
+    w: Int,
+    h: Int,
+    alpha: Float = 1f
+) {
+    drawImage(
+        image = bmp,
+        dstOffset = IntOffset(left.toInt(), top.toInt()),
+        dstSize = IntSize(w, h),
+        alpha = alpha,
+        filterQuality = FilterQuality.None
+    )
+}
+
+/** Tile [bmp] across a rect at uniform scale (192x192 world per tile). */
+private fun DrawScope.tileRect(
+    bmp: ImageBitmap,
+    x0: Float,
+    y0: Float,
+    x1: Float,
+    y1: Float,
+    tileW: Int = 192,
+    tileH: Int = 192
+) {
+    clipRect(left = x0, top = y0, right = x1, bottom = y1) {
+        var py = y0
+        while (py < y1) {
+            var px = x0
+            while (px < x1) {
+                blit(bmp, px, py, tileW, tileH)
+                px += tileW
+            }
+            py += tileH
+        }
+    }
+}
+
+/** Watchtower sprite (native 40x56 drawn 100x140), base at [baseY]. */
+fun DrawScope.drawWatchtower(art: PixelArt, cx: Float, baseY: Float) {
+    drawShadow(cx, baseY + 4f, 44f, 7f)
+    blit(art.tower, cx - 50f, baseY - 140f, 100, 140)
+}
+
+/** Tree sprite (native 26x32 drawn 78x96). */
+fun DrawScope.drawTree(art: PixelArt, o: Obstacle) {
     val bottom = o.y + o.r * 0.62f
     drawShadow(o.x, bottom - 2f, o.r * 0.95f, o.r * 0.30f)
-    val px = 3f
-    drawPixelSprite(PIXEL_TREE, TREE_PALETTE, o.x - 10f * px, bottom - 24f * px, px)
+    blit(art.tree, o.x - 39f, bottom - 96f, 78, 96)
 }
 
-/** Rock as a pixel sprite (20x12 grid at 3px per pixel). */
-fun DrawScope.drawRock(o: Obstacle) {
+/** Rock sprite (native 24x14 drawn 72x42). */
+fun DrawScope.drawRock(art: PixelArt, o: Obstacle) {
     val bottom = o.y + o.r * 0.72f
     drawShadow(o.x, bottom - 1f, o.r * 1.0f, o.r * 0.30f)
-    val px = 3f
-    drawPixelSprite(PIXEL_ROCK, ROCK_PALETTE, o.x - 10f * px, bottom - 12f * px, px)
+    blit(art.rock, o.x - 36f, bottom - 42f, 72, 42)
 }
 
-/** Crate as a pixel sprite (18x18 grid at 3px per pixel); destroyed = faded. */
-fun DrawScope.drawCrate(c: CrateEnt) {
+/** Crate sprite (native 24x24 drawn 72x72); destroyed = faded. */
+fun DrawScope.drawCrate(art: PixelArt, c: CrateEnt) {
     val alpha = if (c.destroyed) 0.45f else 1f
-    drawShadow(c.x + 3f, c.y + 24f, 27f, 7f)
-    val px = 3f
-    drawPixelSprite(PIXEL_CRATE, CRATE_PALETTE, c.x - 9f * px, c.y - 9f * px, px, alpha)
+    drawShadow(c.x + 3f, c.y + 30f, 30f, 7f)
+    blit(art.crate, c.x - 36f, c.y - 36f, 72, 72, alpha)
     if (!c.destroyed && c.hp < c.maxHp) {
-        drawHealthBar(c.x, c.y - 42f, c.hp / c.maxHp)
+        drawHealthBar(c.x, c.y - 48f, c.hp / c.maxHp)
     }
 }
 
 /**
- * Soldier as a pixel sprite (16x20 grid at 4px per pixel = 64x80 on
- * screen), feet at (x, groundY). The facing is the dominant axis of
- * [facing] — the vector toward the same target auto-fire uses — and the
- * walk frame flips with [stepPhase] while [moving], exactly the moving
- * conditions the v0.2.0 leg animation used. Colours come from the
- * role/faction palette swap, not from [bodyColor] / [pantsColor] (kept
- * in the signature so call sites are unchanged).
+ * Soldier sprite (native 24x30 drawn 76x95), feet at (x, groundY). The
+ * facing is the dominant axis of [facing] — the vector toward the same
+ * target auto-fire uses — and the walk frame flips with [stepPhase]
+ * while [moving], exactly the moving conditions of the old leg animation.
  */
 fun DrawScope.drawStandingFigure(
     x: Float,
     groundY: Float,
-    bodyColor: Color,
-    pantsColor: Color,
     facing: Offset,
     stepPhase: Float,
     moving: Boolean,
-    enemy: Boolean,
-    faction: Faction?
+    set: Map<PixelFacing, Array<ImageBitmap>>
 ) {
     val pixelFacing = if (kotlin.math.abs(facing.y) >= kotlin.math.abs(facing.x)) {
         if (facing.y >= 0f) PixelFacing.DOWN else PixelFacing.UP
@@ -1321,22 +1444,14 @@ fun DrawScope.drawStandingFigure(
     val frame = if (moving) {
         (kotlin.math.floor(stepPhase / Math.PI).toInt() and 1)
     } else 0
-    drawShadow(x, groundY + 4f, 21f, 5f)
-    val px = 4f
-    drawPixelSprite(
-        soldierSprite(pixelFacing, frame),
-        soldierPalette(enemy, faction),
-        x - 8f * px,
-        groundY - 20f * px,
-        px
-    )
+    drawShadow(x, groundY + 4f, 23f, 5f)
+    blit(set.getValue(pixelFacing)[frame], x - 38f, groundY - 95f, 76, 95)
 }
 
-/** Downed member: lying-flat pixel sprite (20x10 grid at 4px), grey kit. */
-fun DrawScope.drawDownFigure(x: Float, y: Float) {
-    drawShadow(x, y + 6f, 24f, 5f)
-    val px = 4f
-    drawPixelSprite(SOLDIER_DOWNED, DOWNED_PALETTE, x - 10f * px, y - 4f * px, px)
+/** Downed member: lying-flat sprite (native 28x13 drawn 88x41). */
+fun DrawScope.drawDownFigure(art: PixelArt, x: Float, y: Float) {
+    drawShadow(x, y + 6f, 26f, 5f)
+    blit(art.downed, x - 44f, y - 18f, 88, 41)
 }
 
 /** Tracer as a chain of small squares, from chest height to chest height. */
@@ -1345,9 +1460,9 @@ fun DrawScope.drawPixelTracer(
     color: Color, alpha: Float
 ) {
     val fromX = x1
-    val fromY = y1 - 46f
+    val fromY = y1 - 55f
     val toX = x2
-    val toY = y2 - 46f
+    val toY = y2 - 55f
     val d = distBetween(fromX, fromY, toX, toY)
     if (d < 1f) return
     val steps = (d / 16f).toInt().coerceIn(1, 24)
@@ -1401,170 +1516,91 @@ fun DrawScope.drawPixelBlast(cx: Float, cy: Float, radius: Float, alpha: Float) 
 }
 
 /** Draws the whole map + entities. Map coordinates = canvas pixels. */
-fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdOn: Boolean) {
+fun DrawScope.drawGame(
+    world: GameWorld,
+    faction: Faction,
+    joyVec: Offset,
+    holdOn: Boolean,
+    art: PixelArt
+) {
     val w = world.w
     val h = world.h
     if (w <= 0f || h <= 0f) return
 
-    // ---- Ground layer: fields, road, canal, fence (no depth sorting). ----
-    val palette = listOf(
-        Color(0xFF7CB342), Color(0xFF9CCC65), Color(0xFFC0CA33),
-        Color(0xFF8BC34A), Color(0xFFAED581), Color(0xFF689F38)
-    )
-    // Dirt between the plots, with sparse hashed pixel speckles.
-    drawRect(color = Color(0xFF9C7B4F), size = Size(w, h))
-    var dirtY = 9f
-    while (dirtY < h - 6f) {
-        var dirtX = 9f
-        while (dirtX < w - 6f) {
-            val dh = pixelHash((dirtX / 9f).toInt(), (dirtY / 9f).toInt(), 99)
-            if (dh % 8 == 0) {
-                drawRect(
-                    color = if (dh % 16 == 0) Color(0xFF8A6A42) else Color(0xFFAC8A5C),
-                    topLeft = Offset(dirtX, dirtY),
-                    size = Size(5f, 5f)
-                )
-            }
-            dirtX += 29f
+    // ---- Ground layer: dirt base, plots, road, canal, fence. ----
+    // Dirt bitmap tiled over the whole map: plots sit ON it, with dirt
+    // visible between them — no dark grid lines anywhere.
+    var dirtY = 0f
+    while (dirtY < h) {
+        var dirtX = 0f
+        while (dirtX < w) {
+            blit(art.dirt, dirtX, dirtY, 192, 192)
+            dirtX += 192f
         }
-        dirtY += 29f
+        dirtY += 192f
     }
+    // Plot kinds by the same index formula as the old colour palette:
+    // 0 = green crop, 1 = light crop, 2 = wheat.
+    val kindOf = listOf(0, 1, 2, 0, 1, 0)
     val cols = 4
     val rows = 6
     val cellW = w / cols
     val cellH = h / rows
     for (i in 0 until cols) {
         for (j in 0 until rows) {
-            val color = palette[(i * 3 + j * 5 + i * j) % palette.size]
-            drawFieldPlot(
-                i * cellW + 4f, j * cellH + 4f,
-                (i + 1) * cellW - 4f, (j + 1) * cellH - 4f,
-                color
+            val kind = kindOf[(i * 3 + j * 5 + i * j) % kindOf.size]
+            val variant = (i + j) % 2
+            val bmp = when (kind) {
+                0 -> if (variant == 0) art.cropA else art.cropB
+                1 -> if (variant == 0) art.lightA else art.lightB
+                else -> if (variant == 0) art.wheatA else art.wheatB
+            }
+            val x0 = i * cellW + 4f
+            val y0 = j * cellH + 4f
+            val x1 = (i + 1) * cellW - 4f
+            val y1 = (j + 1) * cellH - 4f
+            tileRect(bmp, x0, y0, x1, y1)
+            drawRect(
+                color = Color(0xFF5D4630).copy(alpha = 0.50f),
+                topLeft = Offset(x0, y0),
+                size = Size(x1 - x0, y1 - y0),
+                style = Stroke(width = 3f)
+            )
+            drawRect(
+                color = Color.Black.copy(alpha = 0.18f),
+                topLeft = Offset(x0, y1 - 5f),
+                size = Size(x1 - x0, 5f)
             )
         }
     }
 
-    // Dirt road: slanted band with a darker lower edge.
+    // Dirt road: bitmap strip (native 64x16 drawn 192x48) across the map.
     val roadY = h * 0.545f
-    fillPolygon(
-        listOf(
-            Offset(0f, roadY + 34f), Offset(w - 18f, roadY + 34f),
-            Offset(w - 18f, roadY + 40f), Offset(0f, roadY + 40f)
-        ),
-        Color(0xFF7A5C3E)
-    )
-    fillPolygon(
-        listOf(
-            Offset(18f, roadY), Offset(w, roadY),
-            Offset(w - 18f, roadY + 34f), Offset(0f, roadY + 34f)
-        ),
-        Color(0xFFB08968)
-    )
-    // Pixel texture on the road: hashed speckles + two dashed track lines.
-    var roadX = 10f
-    while (roadX < w - 8f) {
-        val rh = pixelHash((roadX / 8f).toInt(), (roadY / 8f).toInt(), 41)
-        if (rh % 3 == 0) {
-            drawRect(
-                color = Color(0xFF96714F),
-                topLeft = Offset(roadX, roadY + 6f + kotlin.math.abs(rh % 22)),
-                size = Size(5f, 5f)
-            )
-        }
-        roadX += 19f
-    }
-    for (trackY in listOf(roadY + 10f, roadY + 25f)) {
-        var dashX = 6f
-        while (dashX < w - 14f) {
-            drawRect(
-                color = Color(0xFF96714F),
-                topLeft = Offset(dashX, trackY),
-                size = Size(9f, 3f)
-            )
-            dashX += 24f
-        }
-    }
+    tileRect(art.road, 0f, roadY, w, roadY + 42f, tileW = 192, tileH = 48)
 
-    // Canal along the right side: bank bands give it depth, the water
-    // strip sits inside them, slightly diagonal, with a highlight line.
+    // Canal along the right side: two baked variants alternate down the
+    // strip, mud banks at both edges.
     val cx0 = w * 0.865f
     val cx1 = w * 0.94f
-    val cShift = 14f
-    fillPolygon(
-        listOf(
-            Offset(cx0 - 7f + cShift, 0f), Offset(cx1 + 7f + cShift, 0f),
-            Offset(cx1 + 7f, h), Offset(cx0 - 7f, h)
-        ),
-        Color(0xFF6D7C4F)
-    )
-    fillPolygon(
-        listOf(
-            Offset(cx0 + cShift, 0f), Offset(cx1 + cShift, 0f),
-            Offset(cx1, h), Offset(cx0, h)
-        ),
-        Color(0xFF42A5F5)
-    )
-    // Pixel detail on the canal: blocky dark bank pixels down both edges,
-    // plus hashed white/light-blue sparkle crosses on the water.
-    var bankY = 4f
-    while (bankY < h - 4f) {
-        val t = bankY / h
-        val lx = cx0 - 5f + cShift * (1f - t)
-        val rx = cx1 + 1f + cShift * (1f - t)
-        drawRect(color = Color(0xFF55613C), topLeft = Offset(lx, bankY), size = Size(5f, 9f))
-        drawRect(color = Color(0xFF55613C), topLeft = Offset(rx, bankY), size = Size(5f, 9f))
-        bankY += 24f
-    }
-    var sparkY = 26f
-    while (sparkY < h - 10f) {
-        val t = sparkY / h
-        val midX = (cx0 + cx1) / 2f + cShift * (1f - t)
-        val sh = pixelHash(7, (sparkY / 10f).toInt(), 1234)
-        val sx = midX + (sh % 18)
-        val sc = if (sh % 3 == 0) Color.White else Color(0xFFBBDEFB)
-        val ss = 3.5f
-        drawRect(color = sc, topLeft = Offset(sx - ss / 2f, sparkY - ss / 2f), size = Size(ss, ss))
-        drawRect(color = sc, topLeft = Offset(sx - ss * 1.5f, sparkY - ss / 2f), size = Size(ss, ss))
-        drawRect(color = sc, topLeft = Offset(sx + ss / 2f, sparkY - ss / 2f), size = Size(ss, ss))
-        drawRect(color = sc, topLeft = Offset(sx - ss / 2f, sparkY - ss * 1.5f), size = Size(ss, ss))
-        drawRect(color = sc, topLeft = Offset(sx - ss / 2f, sparkY + ss / 2f), size = Size(ss, ss))
-        if (sh % 2 == 0) {
-            drawRect(
-                color = Color(0xFF90CAF9),
-                topLeft = Offset(sx - 12f, sparkY + 12f),
-                size = Size(11f, 3f)
+    clipRect(left = cx0, top = 0f, right = cx1, bottom = h) {
+        var cy = 0f
+        var idx = 0
+        while (cy < h) {
+            blit(
+                if (idx % 2 == 0) art.canalA else art.canalB,
+                cx0, cy, (cx1 - cx0).toInt(), 192
             )
+            cy += 192f
+            idx++
         }
-        sparkY += 92f
     }
 
-    // Border fence in blocky pixels: dashed wire rows + posts built from
-    // stacked pixel rects (same slanted geometry as v0.2.0).
+    // Border fence: bitmap segment (post + dashed wires) tiled across.
     val fenceBase = h * 0.16f + 9f
-    for (rail in 0..1) {
-        val yOff = if (rail == 0) -22f else -10f
-        var wireX = 2f
-        while (wireX < w - 9f) {
-            val wy = fenceBase + yOff + (wireX / w) * 8f
-            drawRect(
-                color = Color(0xFF37474F),
-                topLeft = Offset(wireX, wy),
-                size = Size(9f, 3f)
-            )
-            wireX += 15f
-        }
-    }
-    var postX = 10f
-    while (postX < w) {
-        val topY = fenceBase - 22f + (postX / w) * 8f
-        for (seg in 0..2) {
-            drawRect(
-                color = if (seg == 0) Color(0xFF455A64) else Color(0xFF263238),
-                topLeft = Offset(postX, topY + seg * 9f),
-                size = Size(6f, 8f)
-            )
-        }
-        postX += 46f
+    var fenceX = 0f
+    while (fenceX < w) {
+        blit(art.fence, fenceX, fenceBase - 28f, 48, 36)
+        fenceX += 48f
     }
 
     // ---- Depth-sorted layer: towers, cover, crates, soldiers. ----
@@ -1572,17 +1608,17 @@ fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdO
     // so it overlaps whatever stands higher up.
     val drawables = mutableListOf<Pair<Float, DrawScope.() -> Unit>>()
     for (tx in listOf(w * 0.22f, w * 0.68f)) {
-        drawables.add(fenceBase to { drawWatchtower(tx, fenceBase) })
+        drawables.add(fenceBase to { drawWatchtower(art, tx, fenceBase) })
     }
     for (o in world.obstacles) {
         if (o.tree) {
-            drawables.add(o.y + o.r * 0.62f to { drawTree(o) })
+            drawables.add(o.y + o.r * 0.62f to { drawTree(art, o) })
         } else {
-            drawables.add(o.y + o.r * 0.72f to { drawRock(o) })
+            drawables.add(o.y + o.r * 0.72f to { drawRock(art, o) })
         }
     }
     for (c in world.crates) {
-        drawables.add(c.y + 27f to { drawCrate(c) })
+        drawables.add(c.y + 36f to { drawCrate(art, c) })
     }
     for (e in world.enemies) {
         if (!e.alive) continue
@@ -1596,20 +1632,18 @@ fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdO
             distBetween(e.x, e.y, target.x, target.y) > 172f
         drawables.add(e.y to {
             drawStandingFigure(
-                e.x, e.y, Color(0xFF2B2B2B), Color(0xFF111111),
-                eFacing, world.elapsed * 7f + e.phase, eMoving,
-                enemy = true, faction = null
+                e.x, e.y, eFacing, world.elapsed * 7f + e.phase, eMoving, art.enemy
             )
             if (e.hp < e.maxHp) {
-                drawHealthBar(e.x, e.y - 96f, e.hp / e.maxHp, 34f)
+                drawHealthBar(e.x, e.y - 108f, e.hp / e.maxHp, 34f)
             }
         })
     }
-    val uniform = uniformColor(faction)
+    val memberSet = if (faction == Faction.PAKISTAN) art.pak else art.ind
     val squadMoving = !holdOn && joyVec.getDistance() > 3f
     world.members.forEachIndexed { idx, m ->
         if (m.down) {
-            drawables.add(m.y + 6f to { drawDownFigure(m.x, m.y) })
+            drawables.add(m.y + 6f to { drawDownFigure(art, m.x, m.y) })
         } else {
             val tEnemy = world.enemies
                 .filter { it.alive }
@@ -1626,11 +1660,10 @@ fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdO
             }
             drawables.add(m.y to {
                 drawStandingFigure(
-                    m.x, m.y, uniform, shadeOf(uniform, 0.55f),
-                    mFacing, world.elapsed * 11f + idx * 1.3f, squadMoving,
-                    enemy = false, faction = faction
+                    m.x, m.y, mFacing, world.elapsed * 11f + idx * 1.3f,
+                    squadMoving, memberSet
                 )
-                drawHealthBar(m.x, m.y - 96f, m.hp / m.maxHp)
+                drawHealthBar(m.x, m.y - 108f, m.hp / m.maxHp)
             })
         }
     }
@@ -1648,7 +1681,7 @@ fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdO
             FX_ENEMY_TRACER -> drawPixelTracer(
                 fx.x1, fx.y1, fx.x2, fx.y2, Color(0xFFFF7043), a
             )
-            FX_HIT -> drawPixelBurst(fx.x1, fx.y1 - 46f, Color(0xFFFFF59D), a)
+            FX_HIT -> drawPixelBurst(fx.x1, fx.y1 - 55f, Color(0xFFFFF59D), a)
             FX_BLAST -> {
                 val progress = 1f - a
                 val radius = 20f + progress * 95f
