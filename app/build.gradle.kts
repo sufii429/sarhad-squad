@@ -1,7 +1,29 @@
+import java.util.Base64
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// --- Permanent CI debug signing -------------------------------------------
+// GitHub-hosted runners are ephemeral: without this, every build would get a
+// fresh debug key, so new APKs could not install over old ones (and the app's
+// data would be wiped by the forced uninstall each time).
+// The repo carries our own debug keystore as base64 (debug-keystore.b64 at
+// the project root — the standard public debug credentials, not a secret).
+// Decode it once per build and sign the debug variant with it, so the
+// signature is stable forever:
+// SHA-1: 1C:DC:B5:BC:60:C6:1E:C3:32:9A:1B:B2:23:B2:2C:9D:33:18:58:6B
+val ciDebugKeystore: File? = run {
+    val b64 = rootProject.file("debug-keystore.b64")
+    if (!b64.exists()) return@run null
+    val out = layout.buildDirectory.file("ci-debug.keystore").get().asFile
+    if (!out.exists()) {
+        out.parentFile.mkdirs()
+        out.writeBytes(Base64.getMimeDecoder().decode(b64.readText()))
+    }
+    out
 }
 
 android {
@@ -12,11 +34,27 @@ android {
         applicationId = "app.sarhadsquad.android"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
+    }
+
+    signingConfigs {
+        if (ciDebugKeystore != null) {
+            create("ciDebug") {
+                storeFile = ciDebugKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
     }
 
     buildTypes {
+        debug {
+            if (ciDebugKeystore != null) {
+                signingConfig = signingConfigs.getByName("ciDebug")
+            }
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(

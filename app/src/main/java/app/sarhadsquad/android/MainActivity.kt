@@ -30,10 +30,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
@@ -53,8 +55,8 @@ import kotlin.math.sqrt
 import kotlin.random.Random
 
 // ============================================================================
-// Sarhad Squad: Border War — Mission 1 prototype (v0.1.0)
-// 2D top-down squad shooter. TITLE -> GAME -> RESULT state machine.
+// Sarhad Squad: Border War — Mission 1 prototype (v0.2.0)
+// 2.5D oblique squad shooter. TITLE -> GAME -> RESULT state machine.
 // All in-game text is English only.
 // ============================================================================
 
@@ -667,7 +669,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
             // Reading frameTick here redraws the canvas every frame.
             val tick = frameTick
             if (tick >= 0 && world.initialized) {
-                drawGame(world, faction, joyVec)
+                drawGame(world, faction, joyVec, holdOn)
             }
         }
 
@@ -682,7 +684,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.offset {
-                        IntOffset((m.x - 22f).toInt(), (m.y - 54f).toInt())
+                        IntOffset((m.x - 22f).toInt(), (m.y - 92f).toInt())
                     }
                 )
             }
@@ -751,7 +753,15 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
     }
 }
 
-// --- Canvas drawing ----------------------------------------------------------
+// --- Canvas drawing (2.5D oblique rendering; gameplay coordinates unchanged) --
+
+/** Darken / lighten a colour by a factor (slab edges, side faces, shades). */
+fun shadeOf(c: Color, f: Float): Color = Color(
+    (c.red * f).coerceIn(0f, 1f),
+    (c.green * f).coerceIn(0f, 1f),
+    (c.blue * f).coerceIn(0f, 1f),
+    c.alpha
+)
 
 fun DrawScope.drawHealthBar(cx: Float, topY: Float, frac: Float, width: Float = 40f) {
     val f = frac.coerceIn(0f, 1f)
@@ -767,13 +777,303 @@ fun DrawScope.drawHealthBar(cx: Float, topY: Float, frac: Float, width: Float = 
     )
 }
 
+/** Soft ground shadow ellipse centred at (cx, cy). */
+fun DrawScope.drawShadow(cx: Float, cy: Float, rx: Float, ry: Float) {
+    drawOval(
+        color = Color.Black.copy(alpha = 0.20f),
+        topLeft = Offset(cx - rx, cy - ry),
+        size = Size(rx * 2f, ry * 2f)
+    )
+}
+
+/** Fill a simple polygon from a list of points. */
+fun DrawScope.fillPolygon(points: List<Offset>, color: Color) {
+    if (points.size < 3) return
+    val path = Path()
+    path.moveTo(points[0].x, points[0].y)
+    for (i in 1 until points.size) path.lineTo(points[i].x, points[i].y)
+    path.close()
+    drawPath(path, color)
+}
+
+/** Unit facing vector from (x, y) toward (tx, ty), with a fallback. */
+fun facingToward(x: Float, y: Float, tx: Float, ty: Float, fallback: Offset): Offset {
+    val d = distBetween(x, y, tx, ty)
+    if (d < 1f) return fallback
+    return Offset((tx - x) / d, (ty - y) / d)
+}
+
+/**
+ * One field plot as a raised, right-slanted slab: the top face is a
+ * parallelogram leaning right, crop rows follow the same slant, and a
+ * darker ~8px strip along the bottom edge gives the plot its thickness.
+ */
+fun DrawScope.drawFieldPlot(x0: Float, y0: Float, x1: Float, y1: Float, color: Color) {
+    val s = 12f // rightward slant of the top edge
+    // Raised bottom edge (the slab's side face).
+    fillPolygon(
+        listOf(
+            Offset(x0, y1), Offset(x1 - s, y1),
+            Offset(x1 - s, y1 + 8f), Offset(x0, y1 + 8f)
+        ),
+        shadeOf(color, 0.68f)
+    )
+    // Slanted top face.
+    fillPolygon(
+        listOf(
+            Offset(x0 + s, y0), Offset(x1, y0),
+            Offset(x1 - s, y1), Offset(x0, y1)
+        ),
+        color
+    )
+    // Crop rows along the same slant.
+    val rowColor = shadeOf(color, 0.82f)
+    for (k in 1..3) {
+        val t = k / 4f
+        val ry = y0 + (y1 - y0) * t
+        val lx = x0 + s * (1f - t) + 6f
+        val rx = x1 - s * t - 6f
+        drawLine(rowColor, Offset(lx, ry), Offset(rx, ry), strokeWidth = 3f)
+    }
+}
+
+/** Standing watchtower: legs with a cross brace, cabin with side face + roof. */
+fun DrawScope.drawWatchtower(cx: Float, baseY: Float) {
+    val legTop = baseY - 42f
+    val cabinTop = baseY - 72f
+    // Legs and cross brace.
+    drawLine(Color(0xFF4E342E), Offset(cx - 15f, baseY), Offset(cx - 10f, legTop), strokeWidth = 4.5f)
+    drawLine(Color(0xFF4E342E), Offset(cx + 15f, baseY), Offset(cx + 10f, legTop), strokeWidth = 4.5f)
+    drawLine(Color(0xFF5D4037), Offset(cx - 13f, baseY - 8f), Offset(cx + 12f, legTop + 6f), strokeWidth = 2.5f)
+    drawLine(Color(0xFF5D4037), Offset(cx + 13f, baseY - 8f), Offset(cx - 12f, legTop + 6f), strokeWidth = 2.5f)
+    // Cabin side face (darker, offset up-right).
+    fillPolygon(
+        listOf(
+            Offset(cx + 17f, cabinTop + 12f), Offset(cx + 24f, cabinTop + 7f),
+            Offset(cx + 24f, cabinTop + 25f), Offset(cx + 17f, cabinTop + 30f)
+        ),
+        Color(0xFF4E342E)
+    )
+    // Cabin front face + window.
+    drawRect(
+        color = Color(0xFF795548),
+        topLeft = Offset(cx - 17f, cabinTop + 12f),
+        size = Size(34f, 18f)
+    )
+    drawRect(
+        color = Color(0xFF263238),
+        topLeft = Offset(cx - 6f, cabinTop + 17f),
+        size = Size(12f, 8f)
+    )
+    // Trapezoid roof.
+    fillPolygon(
+        listOf(
+            Offset(cx - 23f, cabinTop + 12f), Offset(cx + 25f, cabinTop + 12f),
+            Offset(cx + 13f, cabinTop + 1f), Offset(cx - 13f, cabinTop + 1f)
+        ),
+        Color(0xFF4E342E)
+    )
+    // Platform the cabin sits on.
+    drawRect(
+        color = Color(0xFF5D4037),
+        topLeft = Offset(cx - 21f, legTop - 2f),
+        size = Size(42f, 4f)
+    )
+}
+
+/** Tree: trunk + layered canopy circles shifted upward, shadow at the base. */
+fun DrawScope.drawTree(o: Obstacle) {
+    drawShadow(o.x, o.y + o.r * 0.55f, o.r * 0.95f, o.r * 0.30f)
+    drawRect(
+        color = Color(0xFF5D4037),
+        topLeft = Offset(o.x - 3f, o.y - o.r * 0.35f),
+        size = Size(6f, o.r * 0.9f)
+    )
+    drawCircle(color = Color(0xFF2E7D32), radius = o.r * 0.95f, center = Offset(o.x, o.y - o.r * 0.80f))
+    drawCircle(color = Color(0xFF388E3C), radius = o.r * 0.62f, center = Offset(o.x - o.r * 0.40f, o.y - o.r * 0.50f))
+    drawCircle(color = Color(0xFF43A047), radius = o.r * 0.66f, center = Offset(o.x + o.r * 0.36f, o.y - o.r * 0.55f))
+    drawCircle(color = Color(0xFF66BB6A), radius = o.r * 0.42f, center = Offset(o.x - o.r * 0.12f, o.y - o.r * 1.02f))
+}
+
+/** Rock: lighter top face over a darker side face, shadow at the base. */
+fun DrawScope.drawRock(o: Obstacle) {
+    drawShadow(o.x, o.y + o.r * 0.72f, o.r * 1.0f, o.r * 0.30f)
+    fillPolygon(
+        listOf(
+            Offset(o.x - o.r, o.y + o.r * 0.25f), Offset(o.x + o.r, o.y + o.r * 0.25f),
+            Offset(o.x + o.r * 0.78f, o.y + o.r * 0.72f), Offset(o.x - o.r * 0.75f, o.y + o.r * 0.72f)
+        ),
+        Color(0xFF616161)
+    )
+    fillPolygon(
+        listOf(
+            Offset(o.x - o.r, o.y + o.r * 0.25f), Offset(o.x - o.r * 0.35f, o.y - o.r * 0.62f),
+            Offset(o.x + o.r * 0.45f, o.y - o.r * 0.70f), Offset(o.x + o.r, o.y + o.r * 0.25f)
+        ),
+        Color(0xFF9E9E9E)
+    )
+    fillPolygon(
+        listOf(
+            Offset(o.x - o.r * 0.35f, o.y - o.r * 0.62f), Offset(o.x + o.r * 0.10f, o.y - o.r * 0.66f),
+            Offset(o.x + o.r * 0.05f, o.y - o.r * 0.15f), Offset(o.x - o.r * 0.45f, o.y - o.r * 0.12f)
+        ),
+        Color(0xFFBDBDBD)
+    )
+}
+
+/** Crate as a 3D box: front face (with the X) + lighter top + darker side. */
+fun DrawScope.drawCrate(c: CrateEnt) {
+    val alpha = if (c.destroyed) 0.45f else 1f
+    val front = Color(0xFF8D6E63).copy(alpha = alpha)
+    val top = Color(0xFFA1887F).copy(alpha = alpha)
+    val side = Color(0xFF6D4C41).copy(alpha = alpha)
+    val line = Color(0xFF5D4037).copy(alpha = alpha)
+    drawShadow(c.x + 3f, c.y + 17f, 27f, 7f)
+    // Side face.
+    fillPolygon(
+        listOf(
+            Offset(c.x + 22f, c.y - 16f), Offset(c.x + 30f, c.y - 27f),
+            Offset(c.x + 30f, c.y + 5f), Offset(c.x + 22f, c.y + 16f)
+        ),
+        side
+    )
+    // Top face.
+    fillPolygon(
+        listOf(
+            Offset(c.x - 22f, c.y - 16f), Offset(c.x - 14f, c.y - 27f),
+            Offset(c.x + 30f, c.y - 27f), Offset(c.x + 22f, c.y - 16f)
+        ),
+        top
+    )
+    // Front face with the X.
+    drawRect(color = front, topLeft = Offset(c.x - 22f, c.y - 16f), size = Size(44f, 32f))
+    drawLine(line, Offset(c.x - 22f, c.y - 16f), Offset(c.x + 22f, c.y + 16f), strokeWidth = 3f)
+    drawLine(line, Offset(c.x + 22f, c.y - 16f), Offset(c.x - 22f, c.y + 16f), strokeWidth = 3f)
+    if (!c.destroyed && c.hp < c.maxHp) {
+        drawHealthBar(c.x, c.y - 42f, c.hp / c.maxHp)
+    }
+}
+
+/**
+ * Standing chibi soldier, feet at (x, groundY): shadow, stepping legs,
+ * rounded-rect body, head with helmet (squad) or red headband (enemy),
+ * rifle angled toward [facing]. Squad members also get the flag patch.
+ */
+fun DrawScope.drawStandingFigure(
+    x: Float,
+    groundY: Float,
+    bodyColor: Color,
+    pantsColor: Color,
+    facing: Offset,
+    stepPhase: Float,
+    moving: Boolean,
+    enemy: Boolean,
+    faction: Faction?
+) {
+    val bob = if (moving) kotlin.math.abs(sin(stepPhase.toDouble())).toFloat() * 2f else 0f
+    val gy = groundY - bob
+    drawShadow(x, groundY + 3f, 17f, 4.5f)
+    // Legs: the stepping leg lifts (shortens) while moving.
+    val step = if (moving) sin(stepPhase.toDouble()).toFloat() * 3.5f else 0f
+    val liftL = max(0f, step)
+    val liftR = max(0f, -step)
+    drawRoundRect(
+        color = pantsColor,
+        topLeft = Offset(x - 8.5f, gy - 13f),
+        size = Size(6f, 13f - liftL),
+        cornerRadius = CornerRadius(2.5f, 2.5f)
+    )
+    drawRoundRect(
+        color = pantsColor,
+        topLeft = Offset(x + 2.5f, gy - 13f),
+        size = Size(6f, 13f - liftR),
+        cornerRadius = CornerRadius(2.5f, 2.5f)
+    )
+    // Body.
+    drawRoundRect(
+        color = bodyColor,
+        topLeft = Offset(x - 11f, gy - 34f),
+        size = Size(22f, 21f),
+        cornerRadius = CornerRadius(6f, 6f)
+    )
+    // Rifle: angled line from the hands toward the facing direction.
+    val hx = x + facing.x * 9f
+    val hy = gy - 25f + facing.y * 3f
+    drawLine(
+        Color(0xFF212121),
+        Offset(hx - facing.x * 6f, hy - facing.y * 6f),
+        Offset(hx + facing.x * 17f, hy + facing.y * 17f),
+        strokeWidth = 4f
+    )
+    // Head.
+    val headY = gy - 42f
+    drawCircle(color = Color(0xFFE0B090), radius = 8.5f, center = Offset(x, headY))
+    if (enemy) {
+        // Red headband across the top of the head.
+        drawRect(
+            color = Color(0xFFD32F2F),
+            topLeft = Offset(x - 8.5f, headY - 8.5f),
+            size = Size(17f, 5.5f)
+        )
+    } else {
+        // Helmet dome + brim in a darkened shade of the uniform.
+        val helmet = shadeOf(bodyColor, 0.72f)
+        drawArc(
+            color = helmet,
+            startAngle = 180f,
+            sweepAngle = 180f,
+            useCenter = true,
+            topLeft = Offset(x - 11f, headY - 11f),
+            size = Size(22f, 22f)
+        )
+        drawRect(
+            color = helmet,
+            topLeft = Offset(x - 12f, headY - 1.5f),
+            size = Size(24f, 3f)
+        )
+        // Flag patch on the chest.
+        when (faction) {
+            Faction.PAKISTAN -> {
+                drawRect(color = Color.White, topLeft = Offset(x + 3.5f, gy - 30f), size = Size(3f, 9f))
+                drawRect(color = Color(0xFF046A38), topLeft = Offset(x + 6.5f, gy - 30f), size = Size(7f, 9f))
+            }
+            Faction.INDIA -> {
+                drawRect(color = Color(0xFFFF9933), topLeft = Offset(x + 2f, gy - 31f), size = Size(10f, 3f))
+                drawRect(color = Color.White, topLeft = Offset(x + 2f, gy - 28f), size = Size(10f, 3f))
+                drawRect(color = Color(0xFF138808), topLeft = Offset(x + 2f, gy - 25f), size = Size(10f, 3f))
+            }
+            null -> {}
+        }
+    }
+}
+
+/** Downed member: figure lying flat at ground level, all grey. */
+fun DrawScope.drawDownFigure(x: Float, y: Float) {
+    drawShadow(x, y + 5f, 21f, 5f)
+    drawRoundRect(
+        color = Color(0xFF9E9E9E),
+        topLeft = Offset(x - 18f, y - 6f),
+        size = Size(34f, 12f),
+        cornerRadius = CornerRadius(6f, 6f)
+    )
+    drawCircle(color = Color(0xFFBDBDBD), radius = 6.5f, center = Offset(x + 21f, y))
+    drawArc(
+        color = Color(0xFF757575),
+        startAngle = 180f,
+        sweepAngle = 180f,
+        useCenter = true,
+        topLeft = Offset(x + 14.5f, y - 6.5f),
+        size = Size(13f, 13f)
+    )
+}
+
 /** Draws the whole map + entities. Map coordinates = canvas pixels. */
-fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset) {
+fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdOn: Boolean) {
     val w = world.w
     val h = world.h
     if (w <= 0f || h <= 0f) return
 
-    // Punjab fields: patchwork of greens / yellows.
+    // ---- Ground layer: fields, road, canal, fence (no depth sorting). ----
     val palette = listOf(
         Color(0xFF7CB342), Color(0xFF9CCC65), Color(0xFFC0CA33),
         Color(0xFF8BC34A), Color(0xFFAED581), Color(0xFF689F38)
@@ -786,163 +1086,180 @@ fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset) {
     for (i in 0 until cols) {
         for (j in 0 until rows) {
             val color = palette[(i * 3 + j * 5 + i * j) % palette.size]
-            drawRect(
-                color = color,
-                topLeft = Offset(i * cellW, j * cellH),
-                size = Size(cellW + 1f, cellH + 1f)
+            drawFieldPlot(
+                i * cellW + 4f, j * cellH + 4f,
+                (i + 1) * cellW - 4f, (j + 1) * cellH - 4f,
+                color
             )
         }
     }
 
-    // Dirt road crossing horizontally.
-    drawRect(
-        color = Color(0xFFB08968),
-        topLeft = Offset(0f, h * 0.545f),
-        size = Size(w, 34f)
+    // Dirt road: slanted band with a darker lower edge.
+    val roadY = h * 0.545f
+    fillPolygon(
+        listOf(
+            Offset(0f, roadY + 34f), Offset(w - 18f, roadY + 34f),
+            Offset(w - 18f, roadY + 40f), Offset(0f, roadY + 40f)
+        ),
+        Color(0xFF7A5C3E)
     )
-    drawRect(
-        color = Color(0xFF96714F),
-        topLeft = Offset(0f, h * 0.545f + 15f),
-        size = Size(w, 3f)
+    fillPolygon(
+        listOf(
+            Offset(18f, roadY), Offset(w, roadY),
+            Offset(w - 18f, roadY + 34f), Offset(0f, roadY + 34f)
+        ),
+        Color(0xFFB08968)
     )
-
-    // Canal strip along the right side.
-    drawRect(
-        color = Color(0xFF42A5F5),
-        topLeft = Offset(w * 0.865f, 0f),
-        size = Size(w * 0.075f, h)
-    )
-    drawRect(
-        color = Color(0xFF90CAF9),
-        topLeft = Offset(w * 0.895f, 0f),
-        size = Size(w * 0.012f, h)
+    drawLine(
+        Color(0xFF96714F),
+        Offset(9f, roadY + 17f), Offset(w - 9f, roadY + 17f),
+        strokeWidth = 3f
     )
 
-    // Border fence line across the top, with posts.
-    val fenceY = h * 0.16f
-    drawLine(Color(0xFF37474F), Offset(0f, fenceY), Offset(w, fenceY), strokeWidth = 3f)
-    drawLine(Color(0xFF37474F), Offset(0f, fenceY + 9f), Offset(w, fenceY + 9f), strokeWidth = 2f)
+    // Canal along the right side: bank bands give it depth, the water
+    // strip sits inside them, slightly diagonal, with a highlight line.
+    val cx0 = w * 0.865f
+    val cx1 = w * 0.94f
+    val cShift = 14f
+    fillPolygon(
+        listOf(
+            Offset(cx0 - 7f + cShift, 0f), Offset(cx1 + 7f + cShift, 0f),
+            Offset(cx1 + 7f, h), Offset(cx0 - 7f, h)
+        ),
+        Color(0xFF6D7C4F)
+    )
+    fillPolygon(
+        listOf(
+            Offset(cx0 + cShift, 0f), Offset(cx1 + cShift, 0f),
+            Offset(cx1, h), Offset(cx0, h)
+        ),
+        Color(0xFF42A5F5)
+    )
+    drawLine(
+        Color(0xFF90CAF9),
+        Offset(cx0 + (cx1 - cx0) * 0.62f + cShift, 0f),
+        Offset(cx0 + (cx1 - cx0) * 0.62f, h),
+        strokeWidth = 3f
+    )
+
+    // Border fence: two slanted rails; the posts stand ~26px tall.
+    val fenceBase = h * 0.16f + 9f
+    drawLine(Color(0xFF37474F), Offset(0f, fenceBase - 22f), Offset(w, fenceBase - 14f), strokeWidth = 3f)
+    drawLine(Color(0xFF37474F), Offset(0f, fenceBase - 10f), Offset(w, fenceBase - 2f), strokeWidth = 2f)
     var px = 10f
     while (px < w) {
+        val topY = fenceBase - 22f + (px / w) * 8f
         drawRect(
             color = Color(0xFF263238),
-            topLeft = Offset(px, fenceY - 8f),
-            size = Size(4f, 26f)
+            topLeft = Offset(px, topY),
+            size = Size(5f, 26f)
         )
         px += 46f
     }
-    // Watchtowers (two squares on the fence line).
-    for (tx in listOf(w * 0.22f, w * 0.68f)) {
-        drawRect(
-            color = Color(0xFF6D4C41),
-            topLeft = Offset(tx - 19f, fenceY - 19f),
-            size = Size(38f, 38f)
-        )
-        drawRect(
-            color = Color(0xFF4E342E),
-            topLeft = Offset(tx - 12f, fenceY - 12f),
-            size = Size(24f, 24f)
-        )
-    }
 
-    // Cover: trees and rocks.
+    // ---- Depth-sorted layer: towers, cover, crates, soldiers. ----
+    // Sorted by base (feet) Y ascending: lower on screen draws later,
+    // so it overlaps whatever stands higher up.
+    val drawables = mutableListOf<Pair<Float, DrawScope.() -> Unit>>()
+    for (tx in listOf(w * 0.22f, w * 0.68f)) {
+        drawables.add(fenceBase to { drawWatchtower(tx, fenceBase) })
+    }
     for (o in world.obstacles) {
         if (o.tree) {
-            drawCircle(color = Color(0xFF5D4037), radius = o.r * 0.28f, center = Offset(o.x, o.y))
-            drawCircle(color = Color(0xFF2E7D32), radius = o.r, center = Offset(o.x, o.y))
-            drawCircle(color = Color(0xFF43A047), radius = o.r * 0.62f, center = Offset(o.x, o.y))
+            drawables.add(o.y + o.r * 0.55f to { drawTree(o) })
         } else {
-            drawCircle(color = Color(0xFF757575), radius = o.r, center = Offset(o.x, o.y))
-            drawCircle(color = Color(0xFF9E9E9E), radius = o.r * 0.55f, center = Offset(o.x - o.r * 0.2f, o.y - o.r * 0.2f))
+            drawables.add(o.y + o.r * 0.72f to { drawRock(o) })
         }
     }
-
-    // Destructible crates (44px boxes with an X).
     for (c in world.crates) {
-        val half = 22f
-        val base = if (c.destroyed) Color(0xFF4E342E).copy(alpha = 0.45f) else Color(0xFF8D6E63)
-        drawRect(
-            color = base,
-            topLeft = Offset(c.x - half, c.y - half),
-            size = Size(half * 2f, half * 2f)
-        )
-        drawLine(Color(0xFF5D4037), Offset(c.x - half, c.y - half), Offset(c.x + half, c.y + half), strokeWidth = 3f)
-        drawLine(Color(0xFF5D4037), Offset(c.x + half, c.y - half), Offset(c.x - half, c.y + half), strokeWidth = 3f)
-        if (!c.destroyed && c.hp < c.maxHp) {
-            drawHealthBar(c.x, c.y - half - 12f, c.hp / c.maxHp)
-        }
+        drawables.add(c.y + 16f to { drawCrate(c) })
     }
-
-    // Enemies: dark figures with a red headband dot.
     for (e in world.enemies) {
         if (!e.alive) continue
-        drawCircle(color = Color(0xFF2B2B2B), radius = 14f, center = Offset(e.x, e.y))
-        drawCircle(color = Color(0xFFD7A17A), radius = 6.5f, center = Offset(e.x, e.y))
-        drawCircle(color = Color(0xFFD32F2F), radius = 3.5f, center = Offset(e.x, e.y - 7f))
-        if (e.hp < e.maxHp) {
-            drawHealthBar(e.x, e.y - 30f, e.hp / e.maxHp, 34f)
+        val target = world.members
+            .filter { !it.down }
+            .minByOrNull { distBetween(e.x, e.y, it.x, it.y) }
+        val eFacing = if (target != null) {
+            facingToward(e.x, e.y, target.x, target.y, Offset(0f, 1f))
+        } else Offset(0f, 1f)
+        val eMoving = target == null ||
+            distBetween(e.x, e.y, target.x, target.y) > 172f
+        drawables.add(e.y to {
+            drawStandingFigure(
+                e.x, e.y, Color(0xFF2B2B2B), Color(0xFF111111),
+                eFacing, world.elapsed * 7f + e.phase, eMoving,
+                enemy = true, faction = null
+            )
+            if (e.hp < e.maxHp) {
+                drawHealthBar(e.x, e.y - 64f, e.hp / e.maxHp, 34f)
+            }
+        })
+    }
+    val uniform = uniformColor(faction)
+    val squadMoving = !holdOn && joyVec.getDistance() > 3f
+    world.members.forEachIndexed { idx, m ->
+        if (m.down) {
+            drawables.add(m.y + 6f to { drawDownFigure(m.x, m.y) })
+        } else {
+            val tEnemy = world.enemies
+                .filter { it.alive }
+                .minByOrNull { distBetween(m.x, m.y, it.x, it.y) }
+            val tCrate = if (tEnemy == null) {
+                world.crates
+                    .filter { !it.destroyed }
+                    .minByOrNull { distBetween(m.x, m.y, it.x, it.y) }
+            } else null
+            val mFacing = when {
+                tEnemy != null -> facingToward(m.x, m.y, tEnemy.x, tEnemy.y, Offset(0f, -1f))
+                tCrate != null -> facingToward(m.x, m.y, tCrate.x, tCrate.y, Offset(0f, -1f))
+                else -> Offset(0f, -1f)
+            }
+            drawables.add(m.y to {
+                drawStandingFigure(
+                    m.x, m.y, uniform, shadeOf(uniform, 0.55f),
+                    mFacing, world.elapsed * 11f + idx * 1.3f, squadMoving,
+                    enemy = false, faction = faction
+                )
+                drawHealthBar(m.x, m.y - 64f, m.hp / m.maxHp)
+            })
         }
     }
+    drawables.sortBy { it.first }
+    for (d in drawables) d.second(this)
 
-    // Effects under the squad: tracers, hit flashes, grenade blast.
+    // ---- Effects on top: tracers (at body height), flashes, blast ring. ----
     for (fx in world.effects) {
         val a = (fx.ttl / fx.maxTtl).coerceIn(0f, 1f)
         when (fx.kind) {
             FX_TRACER -> drawLine(
                 Color(0xFFFFEB3B).copy(alpha = a),
-                Offset(fx.x1, fx.y1), Offset(fx.x2, fx.y2), strokeWidth = 2.5f
+                Offset(fx.x1, fx.y1 - 25f), Offset(fx.x2, fx.y2 - 25f), strokeWidth = 2.5f
             )
             FX_ENEMY_TRACER -> drawLine(
                 Color(0xFFFF7043).copy(alpha = a),
-                Offset(fx.x1, fx.y1), Offset(fx.x2, fx.y2), strokeWidth = 2.5f
+                Offset(fx.x1, fx.y1 - 25f), Offset(fx.x2, fx.y2 - 25f), strokeWidth = 2.5f
             )
             FX_HIT -> drawCircle(
                 color = Color(0xFFFFF59D).copy(alpha = a),
                 radius = 7f,
-                center = Offset(fx.x1, fx.y1)
+                center = Offset(fx.x1, fx.y1 - 27f)
             )
             FX_BLAST -> {
                 val progress = 1f - a
                 val radius = 20f + progress * 95f
-                drawCircle(
+                drawOval(
                     color = Color(0xFFFF9800).copy(alpha = 0.22f * a),
-                    radius = radius,
-                    center = Offset(fx.x1, fx.y1)
+                    topLeft = Offset(fx.x1 - radius, fx.y1 - radius * 0.55f),
+                    size = Size(radius * 2f, radius * 1.1f)
                 )
-                drawCircle(
+                drawOval(
                     color = Color(0xFFFF5722).copy(alpha = a),
-                    radius = radius,
-                    center = Offset(fx.x1, fx.y1),
+                    topLeft = Offset(fx.x1 - radius, fx.y1 - radius * 0.55f),
+                    size = Size(radius * 2f, radius * 1.1f),
                     style = Stroke(width = 4f)
                 )
             }
         }
-    }
-
-    // Squad members.
-    val uniform = uniformColor(faction)
-    for (m in world.members) {
-        if (m.down) {
-            // Greyed-out body; the "DOWN" label is a Compose text overlay.
-            drawCircle(color = Color(0xFF9E9E9E), radius = 15f, center = Offset(m.x, m.y))
-            continue
-        }
-        drawCircle(color = uniform, radius = 15f, center = Offset(m.x, m.y))
-        drawCircle(color = Color(0xFFE0B090), radius = 6.5f, center = Offset(m.x, m.y))
-        // Flag patch on the right side of the uniform.
-        when (faction) {
-            Faction.PAKISTAN -> {
-                drawRect(color = Color.White, topLeft = Offset(m.x + 9f, m.y - 5f), size = Size(3f, 10f))
-                drawRect(color = Color(0xFF046A38), topLeft = Offset(m.x + 12f, m.y - 5f), size = Size(8f, 10f))
-            }
-            Faction.INDIA -> {
-                drawRect(color = Color(0xFFFF9933), topLeft = Offset(m.x + 9f, m.y - 5f), size = Size(10f, 3.5f))
-                drawRect(color = Color.White, topLeft = Offset(m.x + 9f, m.y - 1.5f), size = Size(10f, 3.5f))
-                drawRect(color = Color(0xFF138808), topLeft = Offset(m.x + 9f, m.y + 2f), size = Size(10f, 3.5f))
-            }
-        }
-        // The call-sign label is a Compose text overlay (see GameScreen).
-        drawHealthBar(m.x, m.y - 32f, m.hp / m.maxHp)
     }
 
     // Virtual joystick (bottom-left): base + knob.
