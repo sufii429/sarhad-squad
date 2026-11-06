@@ -83,7 +83,7 @@ import java.io.File
 import java.io.FileOutputStream
 
 // ============================================================================
-// Sarhad Squad: Border War — Mission 1 prototype (v0.6.1)
+// Sarhad Squad: Border War — Mission 1 prototype (v0.6.2)
 // Pixel-art squad shooter. TITLE -> GAME -> RESULT state machine.
 // v0.4.0 adds the Stage-1 Feel Pack: visible projectiles, explosion
 // feedback + scorch marks, Canvas damage numbers, combo counter, range
@@ -104,6 +104,15 @@ import java.io.FileOutputStream
 // plots + one broken wheat line), wild-grass tufts scattered on the
 // dirt, a narrower canal, taller darker fence posts, smaller
 // brown-tinted rocks, and synthesized sound + vibration (GameFeel).
+// v0.6.2: two on-device fixes. (1) The HUD strip is part of the
+// layout (a Column) instead of an overlay on the full-screen
+// canvas, so the world's top — fence, tower, tower sentry — can
+// never render underneath it; the HUD's combo/flash lines are
+// always composed so its height never changes mid-mission.
+// (2) Enemy fire made to READ: a star muzzle flash at the gun tip
+// plus glow-halo enemy bullets (the fire logic itself was sound —
+// bullets flew and hit; their 7px dark-orange squares and the
+// pale chest burst were simply invisible on the bright ground).
 // All in-game text is English only.
 // ============================================================================
 
@@ -115,6 +124,7 @@ enum class Screen { TITLE, GAME, RESULT }
 // Tracers are gone in v0.4.0 — fire is carried by real Bullet entities.
 const val FX_HIT = 0
 const val FX_BLAST = 1
+const val FX_MUZZLE = 2 // enemy muzzle flash at the gun tip (v0.6.2)
 
 // Particle kinds for the feel-pack particle list.
 const val PT_SPARK = 0
@@ -356,10 +366,14 @@ fun initWorld(world: GameWorld, w: Float, h: Float) {
     // base point is shared with the draw code and the sentry spawn.
     // v0.6.1: the base has a floor of 330 units — the tower top (base
     // - 140) and the sentry's head (feet at base - 105, drawn 0.78
-    // scale so his head sits at about base - 186) must clear the HUD
-    // information strip by at least 120 units from the world top.
-    // Camp A's tent, crate and pair are placed RELATIVE to the base,
-    // so the whole camp shifts down together, arrangement unchanged.
+    // scale so his head sits at about base - 186) keep at least 120
+    // units of clearance from the world top. Camp A's tent, crate
+    // and pair are placed RELATIVE to the base, so the whole camp
+    // shifts down together, arrangement unchanged.
+    // v0.6.2: the HUD clearance is now structural as well — the game
+    // canvas starts below the HUD strip (see GameScreen), so world
+    // y = 0 is already under no UI at all; this floor now just gives
+    // Camp A its in-field breathing room.
     val towerBaseY = max(h * 0.16f + 9f, 330f)
     world.towers.add(Offset(w * 0.22f, towerBaseY))
     // Camp A decor: a tent below-right of the tower.
@@ -1177,6 +1191,21 @@ fun GameScreen(
                     world.effects.add(
                         Effect(FX_HIT, e.x, e.y, e.x, e.y, 0.08f, 0.08f)
                     )
+                    // Muzzle flash at the gun tip (v0.6.2). The FX_HIT
+                    // burst sits on the shooter's chest and is pale and
+                    // tiny, and the old enemy bullet was a 7px
+                    // deep-orange square — together they made smuggler
+                    // fire read as absent on device. The flash sits one
+                    // gun-length along the shot direction at bullet
+                    // height, from regular scouts and the tower sentry
+                    // alike (this is their shared fire path).
+                    world.effects.add(
+                        Effect(
+                            FX_MUZZLE,
+                            e.x + dir.x * 36f, e.y - 55f + dir.y * 36f,
+                            e.x, e.y, 0.06f, 0.06f
+                        )
+                    )
                     world.feel?.enemyShot()
                 }
             } else if (!e.stationary) {
@@ -1398,94 +1427,24 @@ fun GameScreen(
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(Color(0xFF59743B))) {
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .onSizeChanged { sz ->
-                    if (sz.width > 0 && sz.height > 0 && !world.initialized) {
-                        initWorld(world, sz.width.toFloat(), sz.height.toFloat())
-                        // No real art = no jeep: the intro is skipped
-                        // and the mission starts as before (v0.5.0).
-                        if (sprites == null) world.finishIntro()
-                    }
-                }
-                .pointerInput(Unit) {
-                    awaitPointerEventScope {
-                        // Pointer-id joystick (v0.6.0). The old handler
-                        // read only the FIRST change of every event, so
-                        // a second finger (or the first finger's lift)
-                        // could steal or kill the stick mid-drag. Now:
-                        // the first finger down captures the stick by
-                        // id, only that id moves it, and only that id's
-                        // lift releases it — followed anywhere on the
-                        // canvas, no zone-drop. Other touches are
-                        // ignored while a stick is captured. A quick
-                        // tap (down+up < 250 ms, < 12 units of travel)
-                        // is NOT a stick drag: it is the revive tap.
-                        var stickId: PointerId? = null
-                        var stickBase = Offset.Zero
-                        var downPos = Offset.Zero
-                        var downTimeMs = 0L
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            if (world.initialized && world.intro) {
-                                // Any fresh press skips the intro.
-                                if (event.changes.any {
-                                        it.pressed && !it.previousPressed
-                                    }
-                                ) {
-                                    world.finishIntro()
-                                }
-                                continue
-                            }
-                            val sid = stickId
-                            if (sid != null) {
-                                val change = event.changes
-                                    .firstOrNull { it.id == sid } ?: continue
-                                if (change.pressed) {
-                                    val v = change.position - stickBase
-                                    val l = v.getDistance()
-                                    joyTarget =
-                                        if (l > 60f) v / l * 60f else v
-                                } else {
-                                    // Only the captured finger's lift
-                                    // releases the stick.
-                                    val heldMs =
-                                        change.uptimeMillis - downTimeMs
-                                    val moved = distBetween(
-                                        downPos.x, downPos.y,
-                                        change.position.x, change.position.y
-                                    )
-                                    if (heldMs < 250L && moved < 12f) {
-                                        handleTap(downPos)
-                                    }
-                                    stickId = null
-                                    joyBase = null
-                                    joyTarget = Offset.Zero
-                                }
-                            } else {
-                                val fresh = event.changes.firstOrNull {
-                                    it.pressed && !it.previousPressed
-                                } ?: continue
-                                stickId = fresh.id
-                                stickBase = fresh.position
-                                downPos = fresh.position
-                                downTimeMs = fresh.uptimeMillis
-                                joyBase = fresh.position
-                                joyTarget = Offset.Zero
-                            }
-                        }
-                    }
-                }
-        ) {
-            // Reading frameTick here redraws the canvas every frame.
-            val tick = frameTick
-            if (tick >= 0 && world.initialized) {
-                drawGame(world, faction, joyVec, joyBase, holdOn, art, sprites)
-            }
-        }
-
+    // v0.6.2: the screen is a Column — the HUD strip sits in the
+    // layout flow ABOVE the game canvas instead of overlaid on it.
+    // Before, the root was a Box: a full-screen Canvas with the HUD
+    // Column drawn over its top (80%-alpha background), so the
+    // world's top strip — fence, tower top and the tower sentry —
+    // always rendered underneath the HUD. v0.6.1's 330-unit floor
+    // put the sentry's head ~144 units below the world top, but the
+    // HUD strip is taller than that in pixels on a real phone
+    // (~200 px at typical density), so he stayed covered. Now the
+    // canvas physically starts below the HUD: initWorld reads the
+    // canvas size, so world y = 0 IS the canvas top, pointer
+    // positions are canvas-local and match world coordinates 1:1
+    // exactly as before, and nothing of the world can ever be
+    // drawn under the HUD. The HUD's combo/flash lines are always
+    // composed (invisible when inactive) so the HUD height — and
+    // thus the canvas size and the world — never changes size
+    // mid-mission.
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFF59743B))) {
         // HUD (top bar).
         Column(
             modifier = Modifier
@@ -1503,67 +1462,162 @@ fun GameScreen(
                 "MISSION 1 — DAWN PATROL",
                 color = Color.White,
                 fontSize = 15.sp,
-                fontWeight = FontWeight.Bold
+                fontWeight = FontWeight.Bold,
+                maxLines = 1
             )
             Text(
                 "Scouts cleared: $cleared/8   Crates destroyed: $cratesGone/3",
                 color = Color(0xFFCFD8C3),
-                fontSize = 13.sp
+                fontSize = 13.sp,
+                maxLines = 1
             )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text("Time: ${formatTime(world.elapsed)}", color = Color(0xFFCFD8C3), fontSize = 13.sp)
-                Text(hpLine, color = Color(0xFFCFD8C3), fontSize = 13.sp)
+                Text("Time: ${formatTime(world.elapsed)}", color = Color(0xFFCFD8C3), fontSize = 13.sp, maxLines = 1)
+                Text(hpLine, color = Color(0xFFCFD8C3), fontSize = 13.sp, maxLines = 1)
             }
-            if (world.combo >= 2) {
-                Text(
-                    "COMBO ×${world.combo}",
-                    color = Color(0xFFFF5DA2),
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-            if (world.flashTtl > 0f && world.flashText.isNotEmpty()) {
-                Text(
-                    world.flashText,
-                    color = Color(0xFFFFEB3B),
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
+            // v0.6.2: the combo and flash lines are ALWAYS composed —
+            // invisible (alpha 0) while inactive — so the HUD strip
+            // is one fixed height for the whole mission. That keeps
+            // the canvas below it (and the world initialised from the
+            // canvas size) from ever resizing mid-mission.
+            Text(
+                if (world.combo >= 2) "COMBO ×${world.combo}" else "COMBO",
+                color = Color(0xFFFF5DA2).copy(alpha = if (world.combo >= 2) 1f else 0f),
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text(
+                if (world.flashTtl > 0f && world.flashText.isNotEmpty()) world.flashText else " ",
+                color = Color(0xFFFFEB3B).copy(
+                    alpha = if (world.flashTtl > 0f && world.flashText.isNotEmpty()) 1f else 0f
+                ),
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                modifier = Modifier.fillMaxWidth()
+            )
         }
 
-        // Controls (bottom-right): HOLD toggle + GRENADE.
-        Row(
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(end = 16.dp, bottom = 28.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            val tick = frameTick
-            Button(
-                onClick = { holdOn = !holdOn },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (holdOn) Color(0xFFC62828) else Color(0xFF3A4A38)
-                ),
-                modifier = Modifier.height(60.dp)
-            ) { Text(if (holdOn) "HOLDING" else "HOLD") }
-            Button(
-                onClick = { throwGrenade() },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6D4C41)),
-                modifier = Modifier.height(60.dp)
+        Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .onSizeChanged { sz ->
+                        if (sz.width > 0 && sz.height > 0 && !world.initialized) {
+                            initWorld(world, sz.width.toFloat(), sz.height.toFloat())
+                            // No real art = no jeep: the intro is skipped
+                            // and the mission starts as before (v0.5.0).
+                            if (sprites == null) world.finishIntro()
+                        }
+                    }
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            // Pointer-id joystick (v0.6.0). The old handler
+                            // read only the FIRST change of every event, so
+                            // a second finger (or the first finger's lift)
+                            // could steal or kill the stick mid-drag. Now:
+                            // the first finger down captures the stick by
+                            // id, only that id moves it, and only that id's
+                            // lift releases it — followed anywhere on the
+                            // canvas, no zone-drop. Other touches are
+                            // ignored while a stick is captured. A quick
+                            // tap (down+up < 250 ms, < 12 units of travel)
+                            // is NOT a stick drag: it is the revive tap.
+                            var stickId: PointerId? = null
+                            var stickBase = Offset.Zero
+                            var downPos = Offset.Zero
+                            var downTimeMs = 0L
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                if (world.initialized && world.intro) {
+                                    // Any fresh press skips the intro.
+                                    if (event.changes.any {
+                                            it.pressed && !it.previousPressed
+                                        }
+                                    ) {
+                                        world.finishIntro()
+                                    }
+                                    continue
+                                }
+                                val sid = stickId
+                                if (sid != null) {
+                                    val change = event.changes
+                                        .firstOrNull { it.id == sid } ?: continue
+                                    if (change.pressed) {
+                                        val v = change.position - stickBase
+                                        val l = v.getDistance()
+                                        joyTarget =
+                                            if (l > 60f) v / l * 60f else v
+                                    } else {
+                                        // Only the captured finger's lift
+                                        // releases the stick.
+                                        val heldMs =
+                                            change.uptimeMillis - downTimeMs
+                                        val moved = distBetween(
+                                            downPos.x, downPos.y,
+                                            change.position.x, change.position.y
+                                        )
+                                        if (heldMs < 250L && moved < 12f) {
+                                            handleTap(downPos)
+                                        }
+                                        stickId = null
+                                        joyBase = null
+                                        joyTarget = Offset.Zero
+                                    }
+                                } else {
+                                    val fresh = event.changes.firstOrNull {
+                                        it.pressed && !it.previousPressed
+                                    } ?: continue
+                                    stickId = fresh.id
+                                    stickBase = fresh.position
+                                    downPos = fresh.position
+                                    downTimeMs = fresh.uptimeMillis
+                                    joyBase = fresh.position
+                                    joyTarget = Offset.Zero
+                                }
+                            }
+                        }
+                    }
             ) {
-                Text(
-                    if (world.grenadeCd > 0f)
-                        "GRENADE ${world.grenadeCd.toInt() + 1}" else "GRENADE"
-                )
+                // Reading frameTick here redraws the canvas every frame.
+                val tick = frameTick
+                if (tick >= 0 && world.initialized) {
+                    drawGame(world, faction, joyVec, joyBase, holdOn, art, sprites)
+                }
+            }
+            // Controls (bottom-right): HOLD toggle + GRENADE.
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 16.dp, bottom = 28.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val tick = frameTick
+                Button(
+                    onClick = { holdOn = !holdOn },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (holdOn) Color(0xFFC62828) else Color(0xFF3A4A38)
+                    ),
+                    modifier = Modifier.height(60.dp)
+                ) { Text(if (holdOn) "HOLDING" else "HOLD") }
+                Button(
+                    onClick = { throwGrenade() },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6D4C41)),
+                    modifier = Modifier.height(60.dp)
+                ) {
+                    Text(
+                        if (world.grenadeCd > 0f)
+                            "GRENADE ${world.grenadeCd.toInt() + 1}" else "GRENADE"
+                    )
+                }
             }
         }
     }
@@ -2729,26 +2783,71 @@ fun DrawScope.drawDownFigure(art: PixelArt, x: Float, y: Float) {
     blit(art.downed, x - 44f, y - 18f, 88, 41)
 }
 
-/** One bullet in flight: a bright square at chest height + 2 trail squares. */
+/**
+ * One bullet in flight at chest height (logical y - 55).
+ * Member rounds: the pale square + trail squares, unchanged.
+ * Enemy rounds (v0.6.2): the old 7px deep-orange (0xFFFF7043) square
+ * vanished against the bright dirt and wheat — smuggler fire looked
+ * absent on device even though the bullets flew and hit. Enemy
+ * rounds now carry an orange glow halo with a white-yellow core,
+ * over the same fading trail.
+ */
 fun DrawScope.drawBullet(b: Bullet) {
     val cy = b.y - 55f
-    val head = if (b.fromEnemy) Color(0xFFFF7043) else Color(0xFFFFF59D)
-    val trail = if (b.fromEnemy) Color(0xFFFFAB91) else Color(0xFFFFFFFF)
+    if (b.fromEnemy) {
+        for (i in 2 downTo 1) {
+            val tx = b.x - b.dirX * 10f * i
+            val ty = cy - b.dirY * 10f * i
+            val s = 6f - 1.6f * i
+            drawRect(
+                color = Color(0xFFFFAB91).copy(alpha = 0.55f - 0.18f * i),
+                topLeft = Offset(tx - s / 2f, ty - s / 2f),
+                size = Size(s, s)
+            )
+        }
+        drawCircle(
+            color = Color(0xFFFF9800).copy(alpha = 0.6f),
+            radius = 9f,
+            center = Offset(b.x, cy)
+        )
+        drawCircle(color = Color(0xFFFFF59D), radius = 5f, center = Offset(b.x, cy))
+        drawCircle(color = Color.White, radius = 2.6f, center = Offset(b.x, cy))
+        return
+    }
     for (i in 2 downTo 1) {
         val tx = b.x - b.dirX * 10f * i
         val ty = cy - b.dirY * 10f * i
         val s = 6f - 1.6f * i
         drawRect(
-            color = trail.copy(alpha = 0.55f - 0.18f * i),
+            color = Color.White.copy(alpha = 0.55f - 0.18f * i),
             topLeft = Offset(tx - s / 2f, ty - s / 2f),
             size = Size(s, s)
         )
     }
     drawRect(
-        color = head,
+        color = Color(0xFFFFF59D),
         topLeft = Offset(b.x - 3.5f, cy - 3.5f),
         size = Size(7f, 7f)
     )
+}
+
+/**
+ * Enemy muzzle flash (v0.6.2): a ~60 ms star at the gun tip — long
+ * orange spikes, a yellow mid-star and a white core — drawn in the
+ * effects pass, above the figures. The members' chest-level
+ * [drawPixelBurst] stays as it is; this one is only for enemy fire,
+ * whose old presentation (the same pale burst plus a 7px dark
+ * bullet) did not read on a real screen.
+ */
+fun DrawScope.drawMuzzleFlash(cx: Float, cy: Float, alpha: Float) {
+    val spike = Color(0xFFFF9800).copy(alpha = alpha * 0.85f)
+    val mid = Color(0xFFFFEB3B).copy(alpha = alpha * 0.95f)
+    val core = Color(0xFFFFFFFF).copy(alpha = alpha)
+    drawRect(color = spike, topLeft = Offset(cx - 15f, cy - 2.5f), size = Size(30f, 5f))
+    drawRect(color = spike, topLeft = Offset(cx - 2.5f, cy - 11f), size = Size(5f, 22f))
+    drawRect(color = mid, topLeft = Offset(cx - 9f, cy - 4f), size = Size(18f, 8f))
+    drawRect(color = mid, topLeft = Offset(cx - 4f, cy - 9f), size = Size(8f, 18f))
+    drawRect(color = core, topLeft = Offset(cx - 4.5f, cy - 4.5f), size = Size(9f, 9f))
 }
 
 /** A pickup on the ground: shadow + bobbing pixel icon. */
@@ -3132,6 +3231,9 @@ private fun DrawScope.drawGameWorld(
         val a = (fx.ttl / fx.maxTtl).coerceIn(0f, 1f)
         when (fx.kind) {
             FX_HIT -> drawPixelBurst(fx.x1, fx.y1 - 55f, Color(0xFFFFF59D), a)
+            // x1/y1 already hold the gun-tip centre at bullet height
+            // (the spawn point did the -55), so no offset here.
+            FX_MUZZLE -> drawMuzzleFlash(fx.x1, fx.y1, a)
             FX_BLAST -> {
                 val progress = 1f - a
                 val radius = 20f + progress * 95f
