@@ -1,7 +1,10 @@
 package app.sarhadsquad.android
 
+import android.content.Context
 import android.os.Bundle
+import android.util.Base64
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas as NativeCanvas
 import android.graphics.Matrix
 import android.graphics.Paint
@@ -54,6 +57,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -69,11 +73,16 @@ import kotlin.math.sqrt
 import kotlin.random.Random
 
 // ============================================================================
-// Sarhad Squad: Border War — Mission 1 prototype (v0.4.0)
+// Sarhad Squad: Border War — Mission 1 prototype (v0.5.0)
 // Pixel-art squad shooter. TITLE -> GAME -> RESULT state machine.
 // v0.4.0 adds the Stage-1 Feel Pack: visible projectiles, explosion
 // feedback + scorch marks, Canvas damage numbers, combo counter, range
 // ring, floating joystick, crate pickups, hit flashes, dust puffs.
+// v0.5.0 swaps in real sprite art for the soldiers, the explosion
+// sequence and the main props. The generated sheets ship in assets as
+// base64 text files (<name>.b64) decoded at runtime, because the repo
+// push tool only accepts text. If any asset fails to load, the
+// code-drawn pixel art remains as the fallback.
 // All in-game text is English only.
 // ============================================================================
 
@@ -206,6 +215,9 @@ class DeathFade(val x: Float, val y: Float, val facing: Offset, var ttl: Float)
 /** A pickup dropped by a destroyed crate, waiting on the ground. */
 class Pickup(val x: Float, val y: Float, val kind: Int, val phase: Float)
 
+/** A playing explosion sequence at a blast point (rendering only). */
+class Boom(val x: Float, val y: Float, val size: Float, var ttl: Float, val maxTtl: Float)
+
 class GameWorld {
     var initialized = false
     var finished = false
@@ -227,6 +239,7 @@ class GameWorld {
     val scorches = mutableListOf<Scorch>()
     val deaths = mutableListOf<DeathFade>()
     val pickups = mutableListOf<Pickup>()
+    val booms = mutableListOf<Boom>()
     var combo = 0
     var comboTimer = 0f
     var rapidTimer = 0f
@@ -432,6 +445,7 @@ fun damageEnemy(world: GameWorld, e: Enemy, dmg: Float) {
 /** Full destruction feedback for a crate: explosion, scorch, shake, drop. */
 fun onCrateDestroyed(world: GameWorld, c: CrateEnt) {
     spawnExplosion(world, c.x, c.y, big = true)
+    world.booms.add(Boom(c.x, c.y, 170f, 0.55f, 0.55f))
     world.scorches.add(Scorch(c.x, c.y + 8f, 44f, (c.x * 7f + c.y).toInt()))
     world.shake = max(world.shake, 8f)
     if (Random.nextFloat() < 0.5f) {
@@ -666,6 +680,9 @@ fun ResultScreen(
 fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
     val world = remember { GameWorld() }
     val art = remember { buildPixelArt() }
+    val context = LocalContext.current
+    // Real sprite art (v0.5.0); null = any asset failed, code art serves.
+    val sprites = remember { loadSpriteAssets(context) }
     var frameTick by remember { mutableIntStateOf(0) }
     var holdOn by remember { mutableStateOf(false) }
     var joyVec by remember { mutableStateOf(Offset.Zero) }
@@ -701,6 +718,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
         }
         world.effects.add(Effect(FX_BLAST, center.x, center.y, center.x, center.y, 0.35f, 0.35f))
         spawnExplosion(world, center.x, center.y, big = true)
+        world.booms.add(Boom(center.x, center.y, 200f, 0.55f, 0.55f))
         world.scorches.add(Scorch(center.x, center.y, 52f, (center.x * 3f + center.y).toInt()))
         world.shake = max(world.shake, 8f)
         world.grenadeCd = 6f
@@ -943,6 +961,14 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
             if (d.ttl <= 0f) dit.remove()
         }
 
+        // -- Explosion sequences count down. --
+        val bot = world.booms.iterator()
+        while (bot.hasNext()) {
+            val bo = bot.next()
+            bo.ttl -= dt
+            if (bo.ttl <= 0f) bot.remove()
+        }
+
         // -- Pickups: collected when a standing member comes close. --
         val kit = world.pickups.iterator()
         while (kit.hasNext()) {
@@ -1073,7 +1099,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
             // Reading frameTick here redraws the canvas every frame.
             val tick = frameTick
             if (tick >= 0 && world.initialized) {
-                drawGame(world, faction, joyVec, joyBase, holdOn, art)
+                drawGame(world, faction, joyVec, joyBase, holdOn, art, sprites)
             }
         }
 
@@ -1771,6 +1797,69 @@ fun buildPixelArt(): PixelArt {
     )
 }
 
+// --- Real sprite art (v0.5.0): generated sheets loaded from assets ----------
+// Sheets ship as base64 text (<name>.b64, decoded at runtime) because
+// the repo push tool only accepts text files.
+// Atlas sheets are 512x384: 4 columns x 3 rows of 128px cells.
+// Row 0 = facing DOWN, row 1 = facing UP, row 2 = facing RIGHT; LEFT is
+// the RIGHT row mirrored. Columns are the walk cycle. Cells are cropped
+// once at load (the same selection drawImage srcOffset/srcSize would do
+// per frame), so the per-frame draw is a plain blit and the mirrored
+// LEFT frames are exact. ANY failure returns null and the game falls
+// back to the code-drawn PixelArt above for everything.
+
+class SpriteAssets(
+    val pak: Map<PixelFacing, Array<ImageBitmap>>,
+    val ind: Map<PixelFacing, Array<ImageBitmap>>,
+    val smuggler: Map<PixelFacing, Array<ImageBitmap>>,
+    val explosion: ImageBitmap,
+    val crate: ImageBitmap,
+    val tower: ImageBitmap,
+    val tree: ImageBitmap,
+    val medkit: ImageBitmap
+)
+
+private fun loadSpriteAssets(context: Context): SpriteAssets? {
+    return try {
+        fun load(name: String): Bitmap {
+            val text = context.assets.open(name).bufferedReader().use { it.readText() }
+            val bytes = Base64.decode(text, Base64.DEFAULT)
+            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                ?: throw IllegalStateException("asset decode failed: $name")
+        }
+
+        fun atlas(name: String): Map<PixelFacing, Array<ImageBitmap>> {
+            val sheet = load(name)
+            fun cell(col: Int, row: Int): ImageBitmap =
+                Bitmap.createBitmap(sheet, col * 128, row * 128, 128, 128)
+                    .asImageBitmap()
+            fun rowFrames(row: Int): Array<ImageBitmap> =
+                Array(4) { col -> cell(col, row) }
+            val right = rowFrames(2)
+            val left = Array(4) { col -> mirrorBitmap(right[col]) }
+            return mapOf(
+                PixelFacing.DOWN to rowFrames(0),
+                PixelFacing.UP to rowFrames(1),
+                PixelFacing.RIGHT to right,
+                PixelFacing.LEFT to left
+            )
+        }
+
+        SpriteAssets(
+            pak = atlas("atlas_pak.b64"),
+            ind = atlas("atlas_india.b64"),
+            smuggler = atlas("atlas_smuggler.b64"),
+            explosion = load("explosion.b64").asImageBitmap(),
+            crate = load("crate.b64").asImageBitmap(),
+            tower = load("tower.b64").asImageBitmap(),
+            tree = load("tree.b64").asImageBitmap(),
+            medkit = load("medkit.b64").asImageBitmap()
+        )
+    } catch (e: Exception) {
+        null
+    }
+}
+
 // --- Sprite blitting (FilterQuality.None keeps the pixels chunky) -----------
 
 private fun DrawScope.blit(
@@ -1843,16 +1932,27 @@ private fun DrawScope.tileRect(
 }
 
 /** Watchtower sprite (native 40x56 drawn 100x140), base at [baseY]. */
-fun DrawScope.drawWatchtower(art: PixelArt, cx: Float, baseY: Float) {
+fun DrawScope.drawWatchtower(art: PixelArt, cx: Float, baseY: Float, assets: SpriteAssets? = null) {
     drawShadow(cx, baseY + 4f, 44f, 7f)
-    blit(art.tower, cx - 50f, baseY - 140f, 100, 140)
+    if (assets != null) {
+        // Real art is tall and thin (131x256): keep its aspect, same
+        // 140 height, anchored at the base like the code-drawn tower.
+        blit(assets.tower, cx - 36f, baseY - 140f, 72, 140)
+    } else {
+        blit(art.tower, cx - 50f, baseY - 140f, 100, 140)
+    }
 }
 
 /** Tree sprite (native 26x32 drawn 78x96). */
-fun DrawScope.drawTree(art: PixelArt, o: Obstacle) {
+fun DrawScope.drawTree(art: PixelArt, o: Obstacle, assets: SpriteAssets? = null) {
     val bottom = o.y + o.r * 0.62f
     drawShadow(o.x, bottom - 2f, o.r * 0.95f, o.r * 0.30f)
-    blit(art.tree, o.x - 39f, bottom - 96f, 78, 96)
+    if (assets != null) {
+        // Real art is near-square (242x256): same 96 height, aspect kept.
+        blit(assets.tree, o.x - 45f, bottom - 96f, 90, 96)
+    } else {
+        blit(art.tree, o.x - 39f, bottom - 96f, 78, 96)
+    }
 }
 
 /** Rock sprite (native 24x14 drawn 72x42). */
@@ -1863,11 +1963,12 @@ fun DrawScope.drawRock(art: PixelArt, o: Obstacle) {
 }
 
 /** Crate sprite (native 24x24 drawn 72x72); destroyed = faded. */
-fun DrawScope.drawCrate(art: PixelArt, c: CrateEnt) {
+fun DrawScope.drawCrate(art: PixelArt, c: CrateEnt, assets: SpriteAssets? = null) {
     val alpha = if (c.destroyed) 0.45f else 1f
     drawShadow(c.x + 3f, c.y + 30f, 30f, 7f)
     blit(
-        art.crate, c.x - 36f, c.y - 36f, 72, 72, alpha,
+        if (assets != null) assets.crate else art.crate,
+        c.x - 36f, c.y - 36f, 72, 72, alpha,
         colorFilter = if (c.flash > 0f) HIT_FLASH_FILTER else null
     )
     if (!c.destroyed && c.hp < c.maxHp) {
@@ -1907,6 +2008,42 @@ fun DrawScope.drawStandingFigure(
     )
 }
 
+/**
+ * Real-art soldier: one 128px atlas cell drawn 104x104, feet at
+ * (x, groundY). The figure fills the bottom 112px of its cell, so the
+ * visible figure stands ~91 units tall — the same presence as the
+ * code-drawn sprite. Same facing rule as [drawStandingFigure]
+ * (dominant axis); the walk column advances at ~7 fps while [moving],
+ * idle is column 0.
+ */
+fun DrawScope.drawAtlasFigure(
+    x: Float,
+    groundY: Float,
+    facing: Offset,
+    elapsed: Float,
+    phase: Float,
+    moving: Boolean,
+    set: Map<PixelFacing, Array<ImageBitmap>>,
+    alpha: Float = 1f,
+    flash: Boolean = false
+) {
+    val pixelFacing = if (kotlin.math.abs(facing.y) >= kotlin.math.abs(facing.x)) {
+        if (facing.y >= 0f) PixelFacing.DOWN else PixelFacing.UP
+    } else {
+        if (facing.x >= 0f) PixelFacing.RIGHT else PixelFacing.LEFT
+    }
+    val frames = set.getValue(pixelFacing)
+    val frame = if (moving) {
+        Math.floorMod((elapsed * 7f + phase).toInt(), frames.size)
+    } else 0
+    drawShadow(x, groundY + 4f, 23f, 5f)
+    blit(
+        frames[frame], x - 52f, groundY - 104f, 104, 104,
+        alpha = alpha,
+        colorFilter = if (flash) HIT_FLASH_FILTER else null
+    )
+}
+
 /** Downed member: lying-flat sprite (native 28x13 drawn 88x41). */
 fun DrawScope.drawDownFigure(art: PixelArt, x: Float, y: Float) {
     drawShadow(x, y + 6f, 26f, 5f)
@@ -1936,10 +2073,16 @@ fun DrawScope.drawBullet(b: Bullet) {
 }
 
 /** A pickup on the ground: shadow + bobbing pixel icon. */
-fun DrawScope.drawPickup(art: PixelArt, pk: Pickup, elapsed: Float) {
+fun DrawScope.drawPickup(art: PixelArt, pk: Pickup, elapsed: Float, assets: SpriteAssets? = null) {
     val bob = sin((elapsed * 3f + pk.phase).toDouble()).toFloat() * 3f
     drawShadow(pk.x, pk.y + 12f, 15f, 4f)
-    val bmp = if (pk.kind == PICKUP_MEDKIT) art.medkit else art.rapid
+    val bmp = if (pk.kind == PICKUP_MEDKIT && assets != null) {
+        assets.medkit
+    } else if (pk.kind == PICKUP_MEDKIT) {
+        art.medkit
+    } else {
+        art.rapid
+    }
     blit(bmp, pk.x - 16f, pk.y - 16f + bob, 32, 32)
 }
 
@@ -1988,7 +2131,8 @@ fun DrawScope.drawGame(
     joyVec: Offset,
     joyBase: Offset?,
     holdOn: Boolean,
-    art: PixelArt
+    art: PixelArt,
+    assets: SpriteAssets? = null
 ) {
     val w = world.w
     val h = world.h
@@ -1999,10 +2143,10 @@ fun DrawScope.drawGame(
         val sx = sin((world.elapsed * 95f).toDouble()).toFloat() * world.shake
         val sy = cos((world.elapsed * 121f).toDouble()).toFloat() * world.shake * 0.7f
         withTransform({ translate(sx, sy) }) {
-            drawGameWorld(world, faction, joyVec, holdOn, art)
+            drawGameWorld(world, faction, joyVec, holdOn, art, assets)
         }
     } else {
-        drawGameWorld(world, faction, joyVec, holdOn, art)
+        drawGameWorld(world, faction, joyVec, holdOn, art, assets)
     }
 
     // Floating joystick: drawn wherever the player's thumb landed.
@@ -2025,7 +2169,8 @@ private fun DrawScope.drawGameWorld(
     faction: Faction,
     joyVec: Offset,
     holdOn: Boolean,
-    art: PixelArt
+    art: PixelArt,
+    assets: SpriteAssets? = null
 ) {
     val w = world.w
     val h = world.h
@@ -2152,17 +2297,17 @@ private fun DrawScope.drawGameWorld(
     // so it overlaps whatever stands higher up.
     val drawables = mutableListOf<Pair<Float, DrawScope.() -> Unit>>()
     for (tx in listOf(w * 0.22f, w * 0.68f)) {
-        drawables.add(fenceBase to { drawWatchtower(art, tx, fenceBase) })
+        drawables.add(fenceBase to { drawWatchtower(art, tx, fenceBase, assets) })
     }
     for (o in world.obstacles) {
         if (o.tree) {
-            drawables.add(o.y + o.r * 0.62f to { drawTree(art, o) })
+            drawables.add(o.y + o.r * 0.62f to { drawTree(art, o, assets) })
         } else {
             drawables.add(o.y + o.r * 0.72f to { drawRock(art, o) })
         }
     }
     for (c in world.crates) {
-        drawables.add(c.y + 36f to { drawCrate(art, c) })
+        drawables.add(c.y + 36f to { drawCrate(art, c, assets) })
     }
     for (e in world.enemies) {
         if (!e.alive) continue
@@ -2175,10 +2320,17 @@ private fun DrawScope.drawGameWorld(
         val eMoving = target == null ||
             distBetween(e.x, e.y, target.x, target.y) > 172f
         drawables.add(e.y to {
-            drawStandingFigure(
-                e.x, e.y, eFacing, world.elapsed * 7f + e.phase, eMoving, art.enemy,
-                flash = e.flash > 0f
-            )
+            if (assets != null) {
+                drawAtlasFigure(
+                    e.x, e.y, eFacing, world.elapsed, e.phase, eMoving,
+                    assets.smuggler, flash = e.flash > 0f
+                )
+            } else {
+                drawStandingFigure(
+                    e.x, e.y, eFacing, world.elapsed * 7f + e.phase, eMoving, art.enemy,
+                    flash = e.flash > 0f
+                )
+            }
             if (e.hp < e.maxHp) {
                 drawHealthBar(e.x, e.y - 108f, e.hp / e.maxHp, 34f)
             }
@@ -2186,16 +2338,24 @@ private fun DrawScope.drawGameWorld(
     }
     for (d in world.deaths) {
         drawables.add(d.y to {
-            drawStandingFigure(
-                d.x, d.y, d.facing, 0f, false, art.enemy,
-                alpha = (d.ttl / 0.25f).coerceIn(0f, 1f)
-            )
+            val fade = (d.ttl / 0.25f).coerceIn(0f, 1f)
+            if (assets != null) {
+                drawAtlasFigure(
+                    d.x, d.y, d.facing, world.elapsed, 0f, false,
+                    assets.smuggler, alpha = fade
+                )
+            } else {
+                drawStandingFigure(
+                    d.x, d.y, d.facing, 0f, false, art.enemy, alpha = fade
+                )
+            }
         })
     }
     for (pk in world.pickups) {
-        drawables.add(pk.y + 2f to { drawPickup(art, pk, world.elapsed) })
+        drawables.add(pk.y + 2f to { drawPickup(art, pk, world.elapsed, assets) })
     }
     val memberSet = if (faction == Faction.PAKISTAN) art.pak else art.ind
+    val memberAtlas = assets?.let { if (faction == Faction.PAKISTAN) it.pak else it.ind }
     val squadMoving = !holdOn && joyVec.getDistance() > 3f
     world.members.forEachIndexed { idx, m ->
         if (m.down) {
@@ -2215,10 +2375,17 @@ private fun DrawScope.drawGameWorld(
                 else -> Offset(0f, -1f)
             }
             drawables.add(m.y to {
-                drawStandingFigure(
-                    m.x, m.y, mFacing, world.elapsed * 11f + idx * 1.3f,
-                    squadMoving, memberSet
-                )
+                if (memberAtlas != null) {
+                    drawAtlasFigure(
+                        m.x, m.y, mFacing, world.elapsed, idx * 1.3f,
+                        squadMoving, memberAtlas
+                    )
+                } else {
+                    drawStandingFigure(
+                        m.x, m.y, mFacing, world.elapsed * 11f + idx * 1.3f,
+                        squadMoving, memberSet
+                    )
+                }
                 drawHealthBar(m.x, m.y - 108f, m.hp / m.maxHp)
             })
         }
@@ -2271,6 +2438,26 @@ private fun DrawScope.drawGameWorld(
     // ---- Bullets in flight, above the entities. ----
     for (b in world.bullets) {
         drawBullet(b)
+    }
+
+    // ---- Explosion sequences (real art): 6 frames over ~0.55 s,
+    // centred on the blast point, over the entities. The particle
+    // flames and the pixel blast ring keep burning alongside. ----
+    if (assets != null) {
+        for (bo in world.booms) {
+            val age = bo.maxTtl - bo.ttl
+            val frame = (age / bo.maxTtl * 6f).toInt().coerceIn(0, 5)
+            drawImage(
+                image = assets.explosion,
+                srcOffset = IntOffset(frame * 128, 0),
+                srcSize = IntSize(128, 128),
+                dstOffset = IntOffset(
+                    (bo.x - bo.size / 2f).toInt(), (bo.y - bo.size / 2f).toInt()
+                ),
+                dstSize = IntSize(bo.size.toInt(), bo.size.toInt()),
+                filterQuality = FilterQuality.None
+            )
+        }
     }
 
     // ---- Floating texts (damage numbers, pickup announcements). ----
