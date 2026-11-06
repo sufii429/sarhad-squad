@@ -30,7 +30,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
@@ -55,8 +54,8 @@ import kotlin.math.sqrt
 import kotlin.random.Random
 
 // ============================================================================
-// Sarhad Squad: Border War — Mission 1 prototype (v0.2.0)
-// 2.5D oblique squad shooter. TITLE -> GAME -> RESULT state machine.
+// Sarhad Squad: Border War — Mission 1 prototype (v0.3.0)
+// Pixel-art squad shooter. TITLE -> GAME -> RESULT state machine.
 // All in-game text is English only.
 // ============================================================================
 
@@ -684,7 +683,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.offset {
-                        IntOffset((m.x - 22f).toInt(), (m.y - 92f).toInt())
+                        IntOffset((m.x - 22f).toInt(), (m.y - 120f).toInt())
                     }
                 )
             }
@@ -753,7 +752,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
     }
 }
 
-// --- Canvas drawing (2.5D oblique rendering; gameplay coordinates unchanged) --
+// --- Canvas drawing (pixel-art rendering; gameplay coordinates unchanged) ---
 
 /** Darken / lighten a colour by a factor (slab edges, side faces, shades). */
 fun shadeOf(c: Color, f: Float): Color = Color(
@@ -762,6 +761,363 @@ fun shadeOf(c: Color, f: Float): Color = Color(
     (c.blue * f).coerceIn(0f, 1f),
     c.alpha
 )
+
+// --- Pixel-art sprite system -------------------------------------------------
+// Sprites are string grids: one char per pixel, '.' is transparent. Every
+// palette carries a near-black outline colour ('K') so figures and props
+// pop against the ground, like the pixel-style target mockup.
+
+enum class PixelFacing { DOWN, UP, LEFT, RIGHT }
+
+fun DrawScope.drawPixelSprite(
+    rows: Array<String>,
+    palette: Map<Char, Color>,
+    left: Float,
+    top: Float,
+    pixel: Float,
+    alpha: Float = 1f
+) {
+    // The +0.7f overlap keeps scaled-up pixels free of hairline gaps.
+    val cell = Size(pixel + 0.7f, pixel + 0.7f)
+    for (r in rows.indices) {
+        val row = rows[r]
+        for (c in row.indices) {
+            val ch = row[c]
+            if (ch == '.' || ch == ' ') continue
+            val color = palette[ch] ?: continue
+            drawRect(
+                color = color.copy(alpha = color.alpha * alpha),
+                topLeft = Offset(left + c * pixel, top + r * pixel),
+                size = cell
+            )
+        }
+    }
+}
+
+/** Stable position hash: same tile, same pattern, every single frame. */
+fun pixelHash(ix: Int, iy: Int, seed: Int): Int {
+    var n = ix * 374761393 + iy * 668265263 + seed * 362437
+    n = (n xor (n shr 13)) * 1274126177
+    return n xor (n shr 16)
+}
+
+// Soldier body rows (16x16) per facing; the two walk frames per facing
+// differ only in the four leg rows appended below the body.
+val SOLDIER_DOWN_BODY = arrayOf(
+    ".....KKKKKK.....",
+    "....KHHHHHHK....",
+    "...KHHhhhhHHK...",
+    "...KHHSSSSHHK...",
+    "....KSSSSSSK....",
+    "....KSSSSSSK....",
+    ".....KUUUUK.....",
+    "..KKUUUUUUUUKK..",
+    ".KUUUKUUUUUURK..",
+    ".KUUUUFFUUUURRK.",
+    ".KUUUUWWUUUURK..",
+    "..KUUUGGUUUUK...",
+    "..KUUUUUUUUUUK..",
+    "..KUUUUUUUUUUK..",
+    "...KUUUUUUUUK...",
+    "...KPPPPPPPPK..."
+)
+val SOLDIER_UP_BODY = arrayOf(
+    ".....KKKKKK.....",
+    "....KHHHHHHK....",
+    "...KHHHHHHHHK...",
+    "...KHHHHHHHHK...",
+    "....KHHHHHHK....",
+    ".....KUUUUK.....",
+    "..KKUUUUUUUUKR..",
+    ".KUUUUUUUUUUURK.",
+    ".KUUUuuuuUUURK..",
+    ".KUUUuuuuUUUUK..",
+    ".KUUUuuuuUUUUK..",
+    "..KUUUUUUUUUK...",
+    "..KUUUUUUUUUK...",
+    "...KUUUUUUUK....",
+    "...KUUUUUUUK....",
+    "...KPPPPPPPK...."
+)
+val SOLDIER_RIGHT_BODY = arrayOf(
+    "....KKKKKKK.....",
+    "...KHHHHHHHK....",
+    "...KHhhhhhHK....",
+    "...KHSSSSSH.....",
+    "....KSSSSSK.....",
+    ".....KUUUK......",
+    "....KUUUUUKKK...",
+    "....KUUUUUKRRRK.",
+    "....KUUFUUKRRRK.",
+    "....KUUGUUKRRRK.",
+    "....KUUUUUK.K...",
+    "....KUUUUUK.....",
+    "....KUUUUUK.....",
+    ".....KUUUK......",
+    ".....KPPPK......",
+    ".....KPPPK......"
+)
+val SOLDIER_LEGS_FRONT_A = arrayOf(
+    "...KPPP..PPPK...",
+    "...KPPP..PPPK...",
+    "...KPPP....PPK..",
+    "..KBBBK....KBBK."
+)
+val SOLDIER_LEGS_FRONT_B = arrayOf(
+    "...KPPP..PPPK...",
+    "....KPPK.KPPPK..",
+    "..KPPK....KPPP..",
+    ".KBBBK......KBBB"
+)
+val SOLDIER_LEGS_SIDE_A = arrayOf(
+    "....KPPK.KPPK...",
+    "....KPPK..KPPK..",
+    "...KPPPK...KPPK.",
+    "...KBBBK....KBBK"
+)
+val SOLDIER_LEGS_SIDE_B = arrayOf(
+    ".....KPPK.KPPK..",
+    "....KPPK.KPPK...",
+    "....KPPK....PPK.",
+    "....KBBK....KBBB"
+)
+val SOLDIER_DOWN_A = SOLDIER_DOWN_BODY + SOLDIER_LEGS_FRONT_A
+val SOLDIER_DOWN_B = SOLDIER_DOWN_BODY + SOLDIER_LEGS_FRONT_B
+val SOLDIER_UP_A = SOLDIER_UP_BODY + SOLDIER_LEGS_FRONT_A
+val SOLDIER_UP_B = SOLDIER_UP_BODY + SOLDIER_LEGS_FRONT_B
+val SOLDIER_RIGHT_A = SOLDIER_RIGHT_BODY + SOLDIER_LEGS_SIDE_A
+val SOLDIER_RIGHT_B = SOLDIER_RIGHT_BODY + SOLDIER_LEGS_SIDE_B
+val SOLDIER_LEFT_A = SOLDIER_RIGHT_A.map { it.reversed() }.toTypedArray()
+val SOLDIER_LEFT_B = SOLDIER_RIGHT_B.map { it.reversed() }.toTypedArray()
+
+fun soldierSprite(facing: PixelFacing, frame: Int): Array<String> = when (facing) {
+    PixelFacing.DOWN -> if (frame == 0) SOLDIER_DOWN_A else SOLDIER_DOWN_B
+    PixelFacing.UP -> if (frame == 0) SOLDIER_UP_A else SOLDIER_UP_B
+    PixelFacing.RIGHT -> if (frame == 0) SOLDIER_RIGHT_A else SOLDIER_RIGHT_B
+    PixelFacing.LEFT -> if (frame == 0) SOLDIER_LEFT_A else SOLDIER_LEFT_B
+}
+
+/** Palette swap on the shared soldier grids: role + faction decide colours. */
+fun soldierPalette(enemy: Boolean, faction: Faction?): Map<Char, Color> {
+    val outline = Color(0xFF0D120C)
+    val skin = Color(0xFFD89A62)
+    val boot = Color(0xFF17130F)
+    val rifle = Color(0xFF241A12)
+    if (enemy) {
+        return mapOf(
+            'K' to outline,
+            'H' to Color(0xFFD32F2F), // red headband
+            'h' to Color(0xFF8E1414),
+            'S' to skin,
+            'U' to Color(0xFF33373B), // charcoal clothes
+            'u' to Color(0xFF202327),
+            'P' to Color(0xFF17181A),
+            'B' to boot,
+            'R' to rifle,
+            'F' to Color(0xFFD32F2F),
+            'W' to Color(0xFF9E9E9E),
+            'G' to Color(0xFF33373B)
+        )
+    }
+    return when (faction) {
+        Faction.INDIA -> mapOf(
+            'K' to outline,
+            'H' to Color(0xFF4C522C),
+            'h' to Color(0xFF7A8152),
+            'S' to skin,
+            'U' to Color(0xFF6B7040), // olive-khaki uniform
+            'u' to Color(0xFF565C31),
+            'P' to Color(0xFF4F5433),
+            'B' to boot,
+            'R' to rifle,
+            'F' to Color(0xFFFF7A1A), // flag patch: saffron / white / green
+            'W' to Color.White,
+            'G' to Color(0xFF138808)
+        )
+        else -> mapOf( // PAKISTAN (and fallback)
+            'K' to outline,
+            'H' to Color(0xFF1F4420),
+            'h' to Color(0xFF40693A),
+            'S' to skin,
+            'U' to Color(0xFF2E5B27), // deep-green uniform
+            'u' to Color(0xFF22451D),
+            'P' to Color(0xFF24471F),
+            'B' to boot,
+            'R' to rifle,
+            'F' to Color(0xFF046A38), // flag patch: green + white
+            'W' to Color.White,
+            'G' to Color(0xFF046A38)
+        )
+    }
+}
+
+// Downed member: dedicated lying-flat sprite (20 wide x 10 tall), grey kit.
+val SOLDIER_DOWNED = arrayOf(
+    ".....KKKKKKKKKK.....",
+    "...KKGGGGGGGGGGKK...",
+    "..KGGKWWWWWWWWKGGK..",
+    "..KGGGGGGGGGGGGGGK..",
+    ".KGGKGGGGGGGGGGKGGK.",
+    ".KGGGGGGGGGGGGGGGGK.",
+    "..KGGGGGGGGGGGGGGK..",
+    "...KKGGGGGGGGGGKK...",
+    "....KBBK....KBBK....",
+    ".....KK......KK....."
+)
+val DOWNED_PALETTE = mapOf(
+    'K' to Color(0xFF14161A),
+    'G' to Color(0xFF8A8F8A),
+    'W' to Color(0xFFC9C9C9),
+    'B' to Color(0xFF2B2B2B)
+)
+
+// Wooden crate (18x18): planks, plank separators and an X brace.
+val PIXEL_CRATE = arrayOf(
+    "....KKKKKKKKKK....",
+    "..KKWWWWWWWWWWKK..",
+    ".KWWWKWWWWWWKWWWK.",
+    ".KWWWKWWWWWWKWWWK.",
+    ".KWWWKWWWWWWKWWWK.",
+    ".KWWWKWWXWWWKWWWK.",
+    ".KWWWKWWWXWWKWWWK.",
+    ".KWWWKWWWWXWKWWWK.",
+    ".KWWWKWWWWWXKWWWK.",
+    ".KWWWKWWWWXWKWWWK.",
+    ".KWWWKWWWXWWKWWWK.",
+    ".KWWWKWWXWWWKWWWK.",
+    ".KWWWKWWWWWWKWWWK.",
+    ".KDDDKDDDDDDKDDDK.",
+    ".KDDDKDDDDDDKDDDK.",
+    "..KKKKKKKKKKKKKK..",
+    "....KKKKKKKKKK....",
+    ".................."
+)
+val CRATE_PALETTE = mapOf(
+    'K' to Color(0xFF2A1A12),
+    'W' to Color(0xFFC08A4E),
+    'D' to Color(0xFF7C4A24),
+    'X' to Color(0xFF5D3520)
+)
+
+// Tree (20x24): three-shade canopy blob over a trunk.
+val PIXEL_TREE = arrayOf(
+    ".......KKKKKK.......",
+    ".....KKGGGGGGKK.....",
+    "....KGGLLGGGGLLGK...",
+    "...KGGGLLGGGGGLLGK..",
+    "..KGGGGLLGGGGGGLLK..",
+    "..KGLLGGGGLLGGGGGK..",
+    ".KGGGGLLGGGGGGLLGGK.",
+    ".KGLLGGGGGLLGGGGGGK.",
+    ".KGGGGGLLGGGGGLLGGK.",
+    "..KGGGGLLGGGGGGLLK..",
+    "..KGLLGGGGLLGGGGGK..",
+    "...KGGGGGLLGGGGGK...",
+    "...KGLLGGGGLLGGGK...",
+    "....KGGGGGGGGGGK....",
+    ".....KKKTTTTKKK.....",
+    ".......KTTTTK.......",
+    ".......KTTTTK.......",
+    ".......KTTTTK.......",
+    ".......KTTTTK.......",
+    ".......KTTTTK.......",
+    ".......KTTTTK.......",
+    ".......KTTTTK.......",
+    ".......KTTTTK.......",
+    ".....KKDDDDDDKK....."
+)
+val TREE_PALETTE = mapOf(
+    'K' to Color(0xFF10250F),
+    'G' to Color(0xFF2E7D32),
+    'L' to Color(0xFF66BB6A),
+    'T' to Color(0xFF6D4C41),
+    'D' to Color(0xFF4E342E)
+)
+
+// Rock (20x12): light top face over darker shaded faces.
+val PIXEL_ROCK = arrayOf(
+    ".......KKKKKK.......",
+    ".....KKLLLLLLKK.....",
+    "....KLLGGGGGGGGLK...",
+    "...KLLGGGGGGGGGGGGK.",
+    "..KLLGGGGGGGGGGGGGGK",
+    "..KGGGGGGGGGGGGGGGGK",
+    ".KGGGGGGGGGGGGGGGGGK",
+    ".KDDDDGGGGGGGGGGDDDK",
+    "..KDDDDDDDDDDDDDDK..",
+    "...KKDDDDDDDDDDKK...",
+    ".....KKKKKKKKKK.....",
+    "...................."
+)
+val ROCK_PALETTE = mapOf(
+    'K' to Color(0xFF202124),
+    'L' to Color(0xFFCFCFCF),
+    'G' to Color(0xFF9E9E9E),
+    'D' to Color(0xFF616161)
+)
+
+// Watchtower (34x46): roof + cabin + platform rows, then generated leg
+// rows with two crossing braces, then two base rows.
+val PIXEL_TOWER_TOP = arrayOf(
+    "............KKKKKKKKKK............",
+    "..........KKKKKKKKKKKKKK..........",
+    "........WWWWWWWWWWWWWWWWWW........",
+    "......WWWWWWWWWWWWWWWWWWWWWW......",
+    "....DDDDDDDDDDDDDDDDDDDDDDDDDD....",
+    "......KKWWWWWWWWWWWWWWWWWWKK......",
+    "......KWWWWWWWWWWWWWWWWWWWWK......",
+    "......KWWWWWDDDDDDDDDDWWWWWK......",
+    "......KWWWWWDDDDDDDDDDWWWWWK......",
+    "......KWWWWWDDDDDDDDDDWWWWWK......",
+    "......KWWWWWWWWWWWWWWWWWWWWK......",
+    "......KKKKKKKKKKKKKKKKKKKKKK......",
+    "....KKKKKKKKKKKKKKKKKKKKKKKKKK....",
+    "....KWWWWWWWWWWWWWWWWWWWWWWWWK....",
+    "....KKKKKKKKKKKKKKKKKKKKKKKKKK....",
+    "......KDDDDDDDDDDDDDDDDDDDDK......",
+    ".......KKKKKKKKKKKKKKKKKKKK.......",
+    "......KDDDDDDDDDDDDDDDDDDDDK......",
+    "......KKKKKKKKKKKKKKKKKKKKKK......",
+    "....KKKKKKKKKKKKKKKKKKKKKKKKKK...."
+)
+val PIXEL_TOWER = PIXEL_TOWER_TOP + Array(24) { row ->
+    val chars = CharArray(34) { '.' }
+    chars[6] = 'K'; chars[7] = 'K'; chars[26] = 'K'; chars[27] = 'K'
+    val braceA = 8 + (row * 17) / 23
+    chars[braceA] = 'K'; chars[braceA + 1] = 'K'
+    val braceB = 25 - (row * 17) / 23
+    chars[braceB] = 'K'; chars[braceB + 1] = 'K'
+    String(chars)
+} + arrayOf(
+    "......KK..................KK......",
+    ".....KKKK................KKKK....."
+)
+val TOWER_PALETTE = mapOf(
+    'K' to Color(0xFF20140D),
+    'W' to Color(0xFFA9743F),
+    'D' to Color(0xFF4A2E1B)
+)
+
+// Tiny 3x3 ground tufts, stamped in tiled rows across the plots.
+val PIXEL_TUFT = arrayOf(
+    "a.a",
+    "aba",
+    "..."
+)
+val PIXEL_WHEAT = arrayOf(
+    ".a.",
+    "aba",
+    "a.a"
+)
+
+fun DrawScope.drawPixelPattern(
+    rows: Array<String>,
+    palette: Map<Char, Color>,
+    left: Float,
+    top: Float,
+    pixel: Float
+) = drawPixelSprite(rows, palette, left, top, pixel)
+
 
 fun DrawScope.drawHealthBar(cx: Float, topY: Float, frac: Float, width: Float = 40f) {
     val f = frac.coerceIn(0f, 1f)
@@ -804,160 +1160,147 @@ fun facingToward(x: Float, y: Float, tx: Float, ty: Float, fallback: Offset): Of
 }
 
 /**
- * One field plot as a raised, right-slanted slab: the top face is a
- * parallelogram leaning right, crop rows follow the same slant, and a
- * darker ~8px strip along the bottom edge gives the plot its thickness.
+ * One field plot in pixel style, inside the same rectangle the v0.2.0
+ * layout used: blocky shaded edges, then tiled pixel texture — crop tuft
+ * clusters for green plots, wheat tufts for the golden plot, sparse
+ * hashed speckles for the plain plot. Hashing is position-based, so the
+ * texture is identical every frame (no flicker).
  */
 fun DrawScope.drawFieldPlot(x0: Float, y0: Float, x1: Float, y1: Float, color: Color) {
-    val s = 12f // rightward slant of the top edge
-    // Raised bottom edge (the slab's side face).
-    fillPolygon(
-        listOf(
-            Offset(x0, y1), Offset(x1 - s, y1),
-            Offset(x1 - s, y1 + 8f), Offset(x0, y1 + 8f)
-        ),
-        shadeOf(color, 0.68f)
+    val wheat = color == Color(0xFFC0CA33)
+    val plain = color == Color(0xFFAED581)
+    val base = if (wheat) Color(0xFFE0AC4C) else color
+    val seedX = (x0 / 10f).toInt()
+    val seedY = (y0 / 10f).toInt()
+    // Blocky slab edges: darker bottom + right strips, lighter top strip.
+    drawRect(
+        color = shadeOf(base, 0.60f),
+        topLeft = Offset(x0, y1),
+        size = Size(x1 - x0, 7f)
     )
-    // Slanted top face.
-    fillPolygon(
-        listOf(
-            Offset(x0 + s, y0), Offset(x1, y0),
-            Offset(x1 - s, y1), Offset(x0, y1)
-        ),
-        color
+    drawRect(
+        color = shadeOf(base, 0.72f),
+        topLeft = Offset(x1, y0),
+        size = Size(5f, y1 - y0 + 7f)
     )
-    // Crop rows along the same slant.
-    val rowColor = shadeOf(color, 0.82f)
-    for (k in 1..3) {
-        val t = k / 4f
-        val ry = y0 + (y1 - y0) * t
-        val lx = x0 + s * (1f - t) + 6f
-        val rx = x1 - s * t - 6f
-        drawLine(rowColor, Offset(lx, ry), Offset(rx, ry), strokeWidth = 3f)
+    drawRect(color = base, topLeft = Offset(x0, y0), size = Size(x1 - x0, y1 - y0))
+    drawRect(
+        color = shadeOf(base, 1.10f).copy(alpha = 0.45f),
+        topLeft = Offset(x0, y0),
+        size = Size(x1 - x0, 4f)
+    )
+    if (wheat) {
+        // Wheat: rows of golden tuft clusters + single stalk pixels.
+        val tuftPalette = mapOf(
+            'a' to Color(0xFFB97F26),
+            'b' to Color(0xFFFFD968)
+        )
+        var ty = y0 + 8f
+        var row = 0
+        while (ty < y1 - 14f) {
+            var tx = x0 + 8f + (row % 2) * 13f
+            while (tx < x1 - 14f) {
+                val hx = (tx / 10f).toInt()
+                val hy = (ty / 10f).toInt()
+                if (kotlin.math.abs(pixelHash(hx, hy, seedX + seedY) % 5) >= 2) {
+                    drawPixelPattern(PIXEL_WHEAT, tuftPalette, tx, ty, 3f)
+                }
+                if (pixelHash(hx, hy, seedX * 3 + 7) % 4 == 0) {
+                    drawRect(
+                        color = Color(0xFFC98F2E),
+                        topLeft = Offset(tx + 16f, ty + 2f),
+                        size = Size(3f, 8f)
+                    )
+                }
+                tx += 36f
+            }
+            ty += 32f
+            row++
+        }
+    } else if (plain) {
+        // Plain plot: sparse darker / lighter pixel speckles only.
+        var ty = y0 + 7f
+        while (ty < y1 - 7f) {
+            var tx = x0 + 7f
+            while (tx < x1 - 7f) {
+                val hsh = pixelHash((tx / 8f).toInt(), (ty / 8f).toInt(), seedX + seedY * 5)
+                if (hsh % 5 == 0) {
+                    drawRect(
+                        color = shadeOf(base, if (hsh % 10 == 0) 1.12f else 0.84f),
+                        topLeft = Offset(tx, ty),
+                        size = Size(4.5f, 4.5f)
+                    )
+                }
+                tx += 19f
+            }
+            ty += 19f
+        }
+    } else {
+        // Crop plot: rows of small 3-shade plant clusters + row dashes.
+        val tuftPalette = mapOf(
+            'a' to shadeOf(base, 0.70f),
+            'b' to shadeOf(base, 1.16f)
+        )
+        var ty = y0 + 8f
+        var row = 0
+        while (ty < y1 - 14f) {
+            var tx = x0 + 8f + (row % 2) * 13f
+            while (tx < x1 - 14f) {
+                val hx = (tx / 10f).toInt()
+                val hy = (ty / 10f).toInt()
+                if (kotlin.math.abs(pixelHash(hx, hy, seedX - seedY) % 5) >= 2) {
+                    drawPixelPattern(PIXEL_TUFT, tuftPalette, tx, ty, 3f)
+                }
+                tx += 36f
+            }
+            ty += 32f
+            row++
+        }
     }
 }
 
-/** Standing watchtower: legs with a cross brace, cabin with side face + roof. */
+/** Watchtower as a pixel sprite (34x46 grid at 2.5px per pixel). */
 fun DrawScope.drawWatchtower(cx: Float, baseY: Float) {
-    val legTop = baseY - 42f
-    val cabinTop = baseY - 72f
-    // Legs and cross brace.
-    drawLine(Color(0xFF4E342E), Offset(cx - 15f, baseY), Offset(cx - 10f, legTop), strokeWidth = 4.5f)
-    drawLine(Color(0xFF4E342E), Offset(cx + 15f, baseY), Offset(cx + 10f, legTop), strokeWidth = 4.5f)
-    drawLine(Color(0xFF5D4037), Offset(cx - 13f, baseY - 8f), Offset(cx + 12f, legTop + 6f), strokeWidth = 2.5f)
-    drawLine(Color(0xFF5D4037), Offset(cx + 13f, baseY - 8f), Offset(cx - 12f, legTop + 6f), strokeWidth = 2.5f)
-    // Cabin side face (darker, offset up-right).
-    fillPolygon(
-        listOf(
-            Offset(cx + 17f, cabinTop + 12f), Offset(cx + 24f, cabinTop + 7f),
-            Offset(cx + 24f, cabinTop + 25f), Offset(cx + 17f, cabinTop + 30f)
-        ),
-        Color(0xFF4E342E)
-    )
-    // Cabin front face + window.
-    drawRect(
-        color = Color(0xFF795548),
-        topLeft = Offset(cx - 17f, cabinTop + 12f),
-        size = Size(34f, 18f)
-    )
-    drawRect(
-        color = Color(0xFF263238),
-        topLeft = Offset(cx - 6f, cabinTop + 17f),
-        size = Size(12f, 8f)
-    )
-    // Trapezoid roof.
-    fillPolygon(
-        listOf(
-            Offset(cx - 23f, cabinTop + 12f), Offset(cx + 25f, cabinTop + 12f),
-            Offset(cx + 13f, cabinTop + 1f), Offset(cx - 13f, cabinTop + 1f)
-        ),
-        Color(0xFF4E342E)
-    )
-    // Platform the cabin sits on.
-    drawRect(
-        color = Color(0xFF5D4037),
-        topLeft = Offset(cx - 21f, legTop - 2f),
-        size = Size(42f, 4f)
-    )
+    drawShadow(cx, baseY + 4f, 42f, 7f)
+    val px = 2.5f
+    drawPixelSprite(PIXEL_TOWER, TOWER_PALETTE, cx - 17f * px, baseY - 46f * px, px)
 }
 
-/** Tree: trunk + layered canopy circles shifted upward, shadow at the base. */
+/** Tree as a pixel sprite (20x24 grid at 3px per pixel). */
 fun DrawScope.drawTree(o: Obstacle) {
-    drawShadow(o.x, o.y + o.r * 0.55f, o.r * 0.95f, o.r * 0.30f)
-    drawRect(
-        color = Color(0xFF5D4037),
-        topLeft = Offset(o.x - 3f, o.y - o.r * 0.35f),
-        size = Size(6f, o.r * 0.9f)
-    )
-    drawCircle(color = Color(0xFF2E7D32), radius = o.r * 0.95f, center = Offset(o.x, o.y - o.r * 0.80f))
-    drawCircle(color = Color(0xFF388E3C), radius = o.r * 0.62f, center = Offset(o.x - o.r * 0.40f, o.y - o.r * 0.50f))
-    drawCircle(color = Color(0xFF43A047), radius = o.r * 0.66f, center = Offset(o.x + o.r * 0.36f, o.y - o.r * 0.55f))
-    drawCircle(color = Color(0xFF66BB6A), radius = o.r * 0.42f, center = Offset(o.x - o.r * 0.12f, o.y - o.r * 1.02f))
+    val bottom = o.y + o.r * 0.62f
+    drawShadow(o.x, bottom - 2f, o.r * 0.95f, o.r * 0.30f)
+    val px = 3f
+    drawPixelSprite(PIXEL_TREE, TREE_PALETTE, o.x - 10f * px, bottom - 24f * px, px)
 }
 
-/** Rock: lighter top face over a darker side face, shadow at the base. */
+/** Rock as a pixel sprite (20x12 grid at 3px per pixel). */
 fun DrawScope.drawRock(o: Obstacle) {
-    drawShadow(o.x, o.y + o.r * 0.72f, o.r * 1.0f, o.r * 0.30f)
-    fillPolygon(
-        listOf(
-            Offset(o.x - o.r, o.y + o.r * 0.25f), Offset(o.x + o.r, o.y + o.r * 0.25f),
-            Offset(o.x + o.r * 0.78f, o.y + o.r * 0.72f), Offset(o.x - o.r * 0.75f, o.y + o.r * 0.72f)
-        ),
-        Color(0xFF616161)
-    )
-    fillPolygon(
-        listOf(
-            Offset(o.x - o.r, o.y + o.r * 0.25f), Offset(o.x - o.r * 0.35f, o.y - o.r * 0.62f),
-            Offset(o.x + o.r * 0.45f, o.y - o.r * 0.70f), Offset(o.x + o.r, o.y + o.r * 0.25f)
-        ),
-        Color(0xFF9E9E9E)
-    )
-    fillPolygon(
-        listOf(
-            Offset(o.x - o.r * 0.35f, o.y - o.r * 0.62f), Offset(o.x + o.r * 0.10f, o.y - o.r * 0.66f),
-            Offset(o.x + o.r * 0.05f, o.y - o.r * 0.15f), Offset(o.x - o.r * 0.45f, o.y - o.r * 0.12f)
-        ),
-        Color(0xFFBDBDBD)
-    )
+    val bottom = o.y + o.r * 0.72f
+    drawShadow(o.x, bottom - 1f, o.r * 1.0f, o.r * 0.30f)
+    val px = 3f
+    drawPixelSprite(PIXEL_ROCK, ROCK_PALETTE, o.x - 10f * px, bottom - 12f * px, px)
 }
 
-/** Crate as a 3D box: front face (with the X) + lighter top + darker side. */
+/** Crate as a pixel sprite (18x18 grid at 3px per pixel); destroyed = faded. */
 fun DrawScope.drawCrate(c: CrateEnt) {
     val alpha = if (c.destroyed) 0.45f else 1f
-    val front = Color(0xFF8D6E63).copy(alpha = alpha)
-    val top = Color(0xFFA1887F).copy(alpha = alpha)
-    val side = Color(0xFF6D4C41).copy(alpha = alpha)
-    val line = Color(0xFF5D4037).copy(alpha = alpha)
-    drawShadow(c.x + 3f, c.y + 17f, 27f, 7f)
-    // Side face.
-    fillPolygon(
-        listOf(
-            Offset(c.x + 22f, c.y - 16f), Offset(c.x + 30f, c.y - 27f),
-            Offset(c.x + 30f, c.y + 5f), Offset(c.x + 22f, c.y + 16f)
-        ),
-        side
-    )
-    // Top face.
-    fillPolygon(
-        listOf(
-            Offset(c.x - 22f, c.y - 16f), Offset(c.x - 14f, c.y - 27f),
-            Offset(c.x + 30f, c.y - 27f), Offset(c.x + 22f, c.y - 16f)
-        ),
-        top
-    )
-    // Front face with the X.
-    drawRect(color = front, topLeft = Offset(c.x - 22f, c.y - 16f), size = Size(44f, 32f))
-    drawLine(line, Offset(c.x - 22f, c.y - 16f), Offset(c.x + 22f, c.y + 16f), strokeWidth = 3f)
-    drawLine(line, Offset(c.x + 22f, c.y - 16f), Offset(c.x - 22f, c.y + 16f), strokeWidth = 3f)
+    drawShadow(c.x + 3f, c.y + 24f, 27f, 7f)
+    val px = 3f
+    drawPixelSprite(PIXEL_CRATE, CRATE_PALETTE, c.x - 9f * px, c.y - 9f * px, px, alpha)
     if (!c.destroyed && c.hp < c.maxHp) {
         drawHealthBar(c.x, c.y - 42f, c.hp / c.maxHp)
     }
 }
 
 /**
- * Standing chibi soldier, feet at (x, groundY): shadow, stepping legs,
- * rounded-rect body, head with helmet (squad) or red headband (enemy),
- * rifle angled toward [facing]. Squad members also get the flag patch.
+ * Soldier as a pixel sprite (16x20 grid at 4px per pixel = 64x80 on
+ * screen), feet at (x, groundY). The facing is the dominant axis of
+ * [facing] — the vector toward the same target auto-fire uses — and the
+ * walk frame flips with [stepPhase] while [moving], exactly the moving
+ * conditions the v0.2.0 leg animation used. Colours come from the
+ * role/faction palette swap, not from [bodyColor] / [pantsColor] (kept
+ * in the signature so call sites are unchanged).
  */
 fun DrawScope.drawStandingFigure(
     x: Float,
@@ -970,100 +1313,90 @@ fun DrawScope.drawStandingFigure(
     enemy: Boolean,
     faction: Faction?
 ) {
-    val bob = if (moving) kotlin.math.abs(sin(stepPhase.toDouble())).toFloat() * 2f else 0f
-    val gy = groundY - bob
-    drawShadow(x, groundY + 3f, 17f, 4.5f)
-    // Legs: the stepping leg lifts (shortens) while moving.
-    val step = if (moving) sin(stepPhase.toDouble()).toFloat() * 3.5f else 0f
-    val liftL = max(0f, step)
-    val liftR = max(0f, -step)
-    drawRoundRect(
-        color = pantsColor,
-        topLeft = Offset(x - 8.5f, gy - 13f),
-        size = Size(6f, 13f - liftL),
-        cornerRadius = CornerRadius(2.5f, 2.5f)
-    )
-    drawRoundRect(
-        color = pantsColor,
-        topLeft = Offset(x + 2.5f, gy - 13f),
-        size = Size(6f, 13f - liftR),
-        cornerRadius = CornerRadius(2.5f, 2.5f)
-    )
-    // Body.
-    drawRoundRect(
-        color = bodyColor,
-        topLeft = Offset(x - 11f, gy - 34f),
-        size = Size(22f, 21f),
-        cornerRadius = CornerRadius(6f, 6f)
-    )
-    // Rifle: angled line from the hands toward the facing direction.
-    val hx = x + facing.x * 9f
-    val hy = gy - 25f + facing.y * 3f
-    drawLine(
-        Color(0xFF212121),
-        Offset(hx - facing.x * 6f, hy - facing.y * 6f),
-        Offset(hx + facing.x * 17f, hy + facing.y * 17f),
-        strokeWidth = 4f
-    )
-    // Head.
-    val headY = gy - 42f
-    drawCircle(color = Color(0xFFE0B090), radius = 8.5f, center = Offset(x, headY))
-    if (enemy) {
-        // Red headband across the top of the head.
-        drawRect(
-            color = Color(0xFFD32F2F),
-            topLeft = Offset(x - 8.5f, headY - 8.5f),
-            size = Size(17f, 5.5f)
-        )
+    val pixelFacing = if (kotlin.math.abs(facing.y) >= kotlin.math.abs(facing.x)) {
+        if (facing.y >= 0f) PixelFacing.DOWN else PixelFacing.UP
     } else {
-        // Helmet dome + brim in a darkened shade of the uniform.
-        val helmet = shadeOf(bodyColor, 0.72f)
-        drawArc(
-            color = helmet,
-            startAngle = 180f,
-            sweepAngle = 180f,
-            useCenter = true,
-            topLeft = Offset(x - 11f, headY - 11f),
-            size = Size(22f, 22f)
-        )
+        if (facing.x >= 0f) PixelFacing.RIGHT else PixelFacing.LEFT
+    }
+    val frame = if (moving) {
+        (kotlin.math.floor(stepPhase / Math.PI).toInt() and 1)
+    } else 0
+    drawShadow(x, groundY + 4f, 21f, 5f)
+    val px = 4f
+    drawPixelSprite(
+        soldierSprite(pixelFacing, frame),
+        soldierPalette(enemy, faction),
+        x - 8f * px,
+        groundY - 20f * px,
+        px
+    )
+}
+
+/** Downed member: lying-flat pixel sprite (20x10 grid at 4px), grey kit. */
+fun DrawScope.drawDownFigure(x: Float, y: Float) {
+    drawShadow(x, y + 6f, 24f, 5f)
+    val px = 4f
+    drawPixelSprite(SOLDIER_DOWNED, DOWNED_PALETTE, x - 10f * px, y - 4f * px, px)
+}
+
+/** Tracer as a chain of small squares, from chest height to chest height. */
+fun DrawScope.drawPixelTracer(
+    x1: Float, y1: Float, x2: Float, y2: Float,
+    color: Color, alpha: Float
+) {
+    val fromX = x1
+    val fromY = y1 - 46f
+    val toX = x2
+    val toY = y2 - 46f
+    val d = distBetween(fromX, fromY, toX, toY)
+    if (d < 1f) return
+    val steps = (d / 16f).toInt().coerceIn(1, 24)
+    val c = color.copy(alpha = alpha)
+    for (i in 0..steps) {
+        val t = i / steps.toFloat()
         drawRect(
-            color = helmet,
-            topLeft = Offset(x - 12f, headY - 1.5f),
-            size = Size(24f, 3f)
+            color = c,
+            topLeft = Offset(fromX + (toX - fromX) * t - 2.5f, fromY + (toY - fromY) * t - 2.5f),
+            size = Size(5f, 5f)
         )
-        // Flag patch on the chest.
-        when (faction) {
-            Faction.PAKISTAN -> {
-                drawRect(color = Color.White, topLeft = Offset(x + 3.5f, gy - 30f), size = Size(3f, 9f))
-                drawRect(color = Color(0xFF046A38), topLeft = Offset(x + 6.5f, gy - 30f), size = Size(7f, 9f))
-            }
-            Faction.INDIA -> {
-                drawRect(color = Color(0xFFFF9933), topLeft = Offset(x + 2f, gy - 31f), size = Size(10f, 3f))
-                drawRect(color = Color.White, topLeft = Offset(x + 2f, gy - 28f), size = Size(10f, 3f))
-                drawRect(color = Color(0xFF138808), topLeft = Offset(x + 2f, gy - 25f), size = Size(10f, 3f))
-            }
-            null -> {}
-        }
     }
 }
 
-/** Downed member: figure lying flat at ground level, all grey. */
-fun DrawScope.drawDownFigure(x: Float, y: Float) {
-    drawShadow(x, y + 5f, 21f, 5f)
-    drawRoundRect(
-        color = Color(0xFF9E9E9E),
-        topLeft = Offset(x - 18f, y - 6f),
-        size = Size(34f, 12f),
-        cornerRadius = CornerRadius(6f, 6f)
-    )
-    drawCircle(color = Color(0xFFBDBDBD), radius = 6.5f, center = Offset(x + 21f, y))
-    drawArc(
-        color = Color(0xFF757575),
-        startAngle = 180f,
-        sweepAngle = 180f,
-        useCenter = true,
-        topLeft = Offset(x + 14.5f, y - 6.5f),
-        size = Size(13f, 13f)
+/** Hit flash as a plus-shaped pixel burst at (cx, cy). */
+fun DrawScope.drawPixelBurst(cx: Float, cy: Float, color: Color, alpha: Float) {
+    val c = color.copy(alpha = alpha)
+    val s = 4f
+    drawRect(color = c, topLeft = Offset(cx - s / 2f, cy - s / 2f), size = Size(s, s))
+    drawRect(color = c, topLeft = Offset(cx - s / 2f - s, cy - s / 2f), size = Size(s, s))
+    drawRect(color = c, topLeft = Offset(cx + s / 2f, cy - s / 2f), size = Size(s, s))
+    drawRect(color = c, topLeft = Offset(cx - s / 2f, cy - s / 2f - s), size = Size(s, s))
+    drawRect(color = c, topLeft = Offset(cx - s / 2f, cy + s / 2f), size = Size(s, s))
+    drawRect(color = c, topLeft = Offset(cx - s / 2f - 2 * s, cy - s / 2f), size = Size(s, s))
+    drawRect(color = c, topLeft = Offset(cx + s / 2f + s, cy - s / 2f), size = Size(s, s))
+    drawRect(color = c, topLeft = Offset(cx - s / 2f, cy - s / 2f - 2 * s), size = Size(s, s))
+    drawRect(color = c, topLeft = Offset(cx - s / 2f, cy + s / 2f + s), size = Size(s, s))
+}
+
+/** Grenade blast as a blocky ring of squares on the ground plane. */
+fun DrawScope.drawPixelBlast(cx: Float, cy: Float, radius: Float, alpha: Float) {
+    val ring = Color(0xFFFF5722).copy(alpha = alpha)
+    val inner = Color(0xFFFFC107).copy(alpha = alpha * 0.9f)
+    val n = 28
+    for (i in 0 until n) {
+        val ang = (i.toDouble() / n) * 2.0 * Math.PI
+        val rx = cx + (cos(ang) * radius).toFloat()
+        val ry = cy + (sin(ang) * radius * 0.62).toFloat()
+        drawRect(color = ring, topLeft = Offset(rx - 3f, ry - 3f), size = Size(6f, 6f))
+        if (i % 2 == 0) {
+            val ix = cx + (cos(ang) * radius * 0.68).toFloat()
+            val iy = cy + (sin(ang) * radius * 0.68 * 0.62).toFloat()
+            drawRect(color = inner, topLeft = Offset(ix - 2f, iy - 2f), size = Size(4f, 4f))
+        }
+    }
+    drawRect(
+        color = Color(0xFFFF9800).copy(alpha = 0.20f * alpha),
+        topLeft = Offset(cx - 7f, cy - 7f),
+        size = Size(14f, 14f)
     )
 }
 
@@ -1078,7 +1411,24 @@ fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdO
         Color(0xFF7CB342), Color(0xFF9CCC65), Color(0xFFC0CA33),
         Color(0xFF8BC34A), Color(0xFFAED581), Color(0xFF689F38)
     )
-    drawRect(color = palette[0], size = Size(w, h))
+    // Dirt between the plots, with sparse hashed pixel speckles.
+    drawRect(color = Color(0xFF9C7B4F), size = Size(w, h))
+    var dirtY = 9f
+    while (dirtY < h - 6f) {
+        var dirtX = 9f
+        while (dirtX < w - 6f) {
+            val dh = pixelHash((dirtX / 9f).toInt(), (dirtY / 9f).toInt(), 99)
+            if (dh % 8 == 0) {
+                drawRect(
+                    color = if (dh % 16 == 0) Color(0xFF8A6A42) else Color(0xFFAC8A5C),
+                    topLeft = Offset(dirtX, dirtY),
+                    size = Size(5f, 5f)
+                )
+            }
+            dirtX += 29f
+        }
+        dirtY += 29f
+    }
     val cols = 4
     val rows = 6
     val cellW = w / cols
@@ -1110,11 +1460,30 @@ fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdO
         ),
         Color(0xFFB08968)
     )
-    drawLine(
-        Color(0xFF96714F),
-        Offset(9f, roadY + 17f), Offset(w - 9f, roadY + 17f),
-        strokeWidth = 3f
-    )
+    // Pixel texture on the road: hashed speckles + two dashed track lines.
+    var roadX = 10f
+    while (roadX < w - 8f) {
+        val rh = pixelHash((roadX / 8f).toInt(), (roadY / 8f).toInt(), 41)
+        if (rh % 3 == 0) {
+            drawRect(
+                color = Color(0xFF96714F),
+                topLeft = Offset(roadX, roadY + 6f + kotlin.math.abs(rh % 22)),
+                size = Size(5f, 5f)
+            )
+        }
+        roadX += 19f
+    }
+    for (trackY in listOf(roadY + 10f, roadY + 25f)) {
+        var dashX = 6f
+        while (dashX < w - 14f) {
+            drawRect(
+                color = Color(0xFF96714F),
+                topLeft = Offset(dashX, trackY),
+                size = Size(9f, 3f)
+            )
+            dashX += 24f
+        }
+    }
 
     // Canal along the right side: bank bands give it depth, the water
     // strip sits inside them, slightly diagonal, with a highlight line.
@@ -1135,26 +1504,67 @@ fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdO
         ),
         Color(0xFF42A5F5)
     )
-    drawLine(
-        Color(0xFF90CAF9),
-        Offset(cx0 + (cx1 - cx0) * 0.62f + cShift, 0f),
-        Offset(cx0 + (cx1 - cx0) * 0.62f, h),
-        strokeWidth = 3f
-    )
+    // Pixel detail on the canal: blocky dark bank pixels down both edges,
+    // plus hashed white/light-blue sparkle crosses on the water.
+    var bankY = 4f
+    while (bankY < h - 4f) {
+        val t = bankY / h
+        val lx = cx0 - 5f + cShift * (1f - t)
+        val rx = cx1 + 1f + cShift * (1f - t)
+        drawRect(color = Color(0xFF55613C), topLeft = Offset(lx, bankY), size = Size(5f, 9f))
+        drawRect(color = Color(0xFF55613C), topLeft = Offset(rx, bankY), size = Size(5f, 9f))
+        bankY += 24f
+    }
+    var sparkY = 26f
+    while (sparkY < h - 10f) {
+        val t = sparkY / h
+        val midX = (cx0 + cx1) / 2f + cShift * (1f - t)
+        val sh = pixelHash(7, (sparkY / 10f).toInt(), 1234)
+        val sx = midX + (sh % 18)
+        val sc = if (sh % 3 == 0) Color.White else Color(0xFFBBDEFB)
+        val ss = 3.5f
+        drawRect(color = sc, topLeft = Offset(sx - ss / 2f, sparkY - ss / 2f), size = Size(ss, ss))
+        drawRect(color = sc, topLeft = Offset(sx - ss * 1.5f, sparkY - ss / 2f), size = Size(ss, ss))
+        drawRect(color = sc, topLeft = Offset(sx + ss / 2f, sparkY - ss / 2f), size = Size(ss, ss))
+        drawRect(color = sc, topLeft = Offset(sx - ss / 2f, sparkY - ss * 1.5f), size = Size(ss, ss))
+        drawRect(color = sc, topLeft = Offset(sx - ss / 2f, sparkY + ss / 2f), size = Size(ss, ss))
+        if (sh % 2 == 0) {
+            drawRect(
+                color = Color(0xFF90CAF9),
+                topLeft = Offset(sx - 12f, sparkY + 12f),
+                size = Size(11f, 3f)
+            )
+        }
+        sparkY += 92f
+    }
 
-    // Border fence: two slanted rails; the posts stand ~26px tall.
+    // Border fence in blocky pixels: dashed wire rows + posts built from
+    // stacked pixel rects (same slanted geometry as v0.2.0).
     val fenceBase = h * 0.16f + 9f
-    drawLine(Color(0xFF37474F), Offset(0f, fenceBase - 22f), Offset(w, fenceBase - 14f), strokeWidth = 3f)
-    drawLine(Color(0xFF37474F), Offset(0f, fenceBase - 10f), Offset(w, fenceBase - 2f), strokeWidth = 2f)
-    var px = 10f
-    while (px < w) {
-        val topY = fenceBase - 22f + (px / w) * 8f
-        drawRect(
-            color = Color(0xFF263238),
-            topLeft = Offset(px, topY),
-            size = Size(5f, 26f)
-        )
-        px += 46f
+    for (rail in 0..1) {
+        val yOff = if (rail == 0) -22f else -10f
+        var wireX = 2f
+        while (wireX < w - 9f) {
+            val wy = fenceBase + yOff + (wireX / w) * 8f
+            drawRect(
+                color = Color(0xFF37474F),
+                topLeft = Offset(wireX, wy),
+                size = Size(9f, 3f)
+            )
+            wireX += 15f
+        }
+    }
+    var postX = 10f
+    while (postX < w) {
+        val topY = fenceBase - 22f + (postX / w) * 8f
+        for (seg in 0..2) {
+            drawRect(
+                color = if (seg == 0) Color(0xFF455A64) else Color(0xFF263238),
+                topLeft = Offset(postX, topY + seg * 9f),
+                size = Size(6f, 8f)
+            )
+        }
+        postX += 46f
     }
 
     // ---- Depth-sorted layer: towers, cover, crates, soldiers. ----
@@ -1166,13 +1576,13 @@ fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdO
     }
     for (o in world.obstacles) {
         if (o.tree) {
-            drawables.add(o.y + o.r * 0.55f to { drawTree(o) })
+            drawables.add(o.y + o.r * 0.62f to { drawTree(o) })
         } else {
             drawables.add(o.y + o.r * 0.72f to { drawRock(o) })
         }
     }
     for (c in world.crates) {
-        drawables.add(c.y + 16f to { drawCrate(c) })
+        drawables.add(c.y + 27f to { drawCrate(c) })
     }
     for (e in world.enemies) {
         if (!e.alive) continue
@@ -1191,7 +1601,7 @@ fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdO
                 enemy = true, faction = null
             )
             if (e.hp < e.maxHp) {
-                drawHealthBar(e.x, e.y - 64f, e.hp / e.maxHp, 34f)
+                drawHealthBar(e.x, e.y - 96f, e.hp / e.maxHp, 34f)
             }
         })
     }
@@ -1220,44 +1630,29 @@ fun DrawScope.drawGame(world: GameWorld, faction: Faction, joyVec: Offset, holdO
                     mFacing, world.elapsed * 11f + idx * 1.3f, squadMoving,
                     enemy = false, faction = faction
                 )
-                drawHealthBar(m.x, m.y - 64f, m.hp / m.maxHp)
+                drawHealthBar(m.x, m.y - 96f, m.hp / m.maxHp)
             })
         }
     }
     drawables.sortBy { it.first }
     for (d in drawables) d.second(this)
 
-    // ---- Effects on top: tracers (at body height), flashes, blast ring. ----
+    // ---- Effects on top, in pixel idiom: square-chain tracers at chest
+    // height, plus-shaped hit bursts, blocky blast ring. ----
     for (fx in world.effects) {
         val a = (fx.ttl / fx.maxTtl).coerceIn(0f, 1f)
         when (fx.kind) {
-            FX_TRACER -> drawLine(
-                Color(0xFFFFEB3B).copy(alpha = a),
-                Offset(fx.x1, fx.y1 - 25f), Offset(fx.x2, fx.y2 - 25f), strokeWidth = 2.5f
+            FX_TRACER -> drawPixelTracer(
+                fx.x1, fx.y1, fx.x2, fx.y2, Color(0xFFFFEB3B), a
             )
-            FX_ENEMY_TRACER -> drawLine(
-                Color(0xFFFF7043).copy(alpha = a),
-                Offset(fx.x1, fx.y1 - 25f), Offset(fx.x2, fx.y2 - 25f), strokeWidth = 2.5f
+            FX_ENEMY_TRACER -> drawPixelTracer(
+                fx.x1, fx.y1, fx.x2, fx.y2, Color(0xFFFF7043), a
             )
-            FX_HIT -> drawCircle(
-                color = Color(0xFFFFF59D).copy(alpha = a),
-                radius = 7f,
-                center = Offset(fx.x1, fx.y1 - 27f)
-            )
+            FX_HIT -> drawPixelBurst(fx.x1, fx.y1 - 46f, Color(0xFFFFF59D), a)
             FX_BLAST -> {
                 val progress = 1f - a
                 val radius = 20f + progress * 95f
-                drawOval(
-                    color = Color(0xFFFF9800).copy(alpha = 0.22f * a),
-                    topLeft = Offset(fx.x1 - radius, fx.y1 - radius * 0.55f),
-                    size = Size(radius * 2f, radius * 1.1f)
-                )
-                drawOval(
-                    color = Color(0xFFFF5722).copy(alpha = a),
-                    topLeft = Offset(fx.x1 - radius, fx.y1 - radius * 0.55f),
-                    size = Size(radius * 2f, radius * 1.1f),
-                    style = Stroke(width = 4f)
-                )
+                drawPixelBlast(fx.x1, fx.y1, radius, a)
             }
         }
     }
