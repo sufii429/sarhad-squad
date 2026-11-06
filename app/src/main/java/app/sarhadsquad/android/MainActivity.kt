@@ -1,7 +1,11 @@
 package app.sarhadsquad.android
 
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.SoundPool
 import android.os.Bundle
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.util.Base64
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -75,9 +79,11 @@ import kotlin.math.min
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.random.Random
+import java.io.File
+import java.io.FileOutputStream
 
 // ============================================================================
-// Sarhad Squad: Border War — Mission 1 prototype (v0.6.0)
+// Sarhad Squad: Border War — Mission 1 prototype (v0.6.1)
 // Pixel-art squad shooter. TITLE -> GAME -> RESULT state machine.
 // v0.4.0 adds the Stage-1 Feel Pack: visible projectiles, explosion
 // feedback + scorch marks, Canvas damage numbers, combo counter, range
@@ -92,6 +98,12 @@ import kotlin.random.Random
 // watchtower sentry), a jeep-arrival intro, a pointer-id joystick that
 // cannot be stolen or dropped, a frame-clock loop with stick smoothing,
 // and the poster title screen.
+// v0.6.1 polish round: Camp A (and its tower sentry) moved down out
+// from under the HUD strip, the sentry drawn at 0.78 scale, the plot
+// grid replaced by an explicit plot list so dirt dominates (3 crop
+// plots + one broken wheat line), wild-grass tufts scattered on the
+// dirt, a narrower canal, taller darker fence posts, smaller
+// brown-tinted rocks, and synthesized sound + vibration (GameFeel).
 // All in-game text is English only.
 // ============================================================================
 
@@ -229,6 +241,23 @@ class Pickup(val x: Float, val y: Float, val kind: Int, val phase: Float)
 /** A playing explosion sequence at a blast point (rendering only). */
 class Boom(val x: Float, val y: Float, val size: Float, var ttl: Float, val maxTtl: Float)
 
+/**
+ * One ground plot (v0.6.1 explicit plot list, absolute world coords).
+ * [main] plots get the border + bottom shade; the small wheat "chip"
+ * rects (main = false) break the wheat patches' silhouettes.
+ */
+class Plot(
+    val x0: Float, val y0: Float, val x1: Float, val y1: Float,
+    val wheat: Boolean, val main: Boolean
+)
+
+/** One wild-grass tuft spot on the dirt (v0.6.1): (x, y) is the
+ * bottom-centre ground anchor; [variant] cycles the 4 atlas cells. */
+class TuftSpot(
+    val x: Float, val y: Float, val size: Float,
+    val variant: Int, val flip: Boolean
+)
+
 class GameWorld {
     var initialized = false
     var finished = false
@@ -265,6 +294,13 @@ class GameWorld {
     val towers = mutableListOf<Offset>()
     val tents = mutableListOf<Offset>()
     var campJeep: Offset? = null
+    // Explicit ground layout (v0.6.1): plot rects + grass tuft spots,
+    // filled by initWorld, read by the ground draw in both art paths.
+    val plots = mutableListOf<Plot>()
+    val tuftSpots = mutableListOf<TuftSpot>()
+    // Sound + vibration (v0.6.1). Optional everywhere: null or any
+    // internal failure leaves the game exactly as before, silently.
+    var feel: GameFeel? = null
     // Jeep-arrival intro (v0.6.0, real-art path only). The jeep drives
     // from jeepStartY up to the drop point, the squad steps out and
     // walks into formation, then control starts. INTRO_LEN total.
@@ -318,10 +354,16 @@ fun initWorld(world: GameWorld, w: Float, h: Float) {
     // as before: 8 scouts (one is the tower sentry) and 3 crates. ---
     // Watchtower on the fence line, anchoring Camp A (upper-left). Its
     // base point is shared with the draw code and the sentry spawn.
-    val towerBaseY = h * 0.16f + 9f
+    // v0.6.1: the base has a floor of 330 units — the tower top (base
+    // - 140) and the sentry's head (feet at base - 105, drawn 0.78
+    // scale so his head sits at about base - 186) must clear the HUD
+    // information strip by at least 120 units from the world top.
+    // Camp A's tent, crate and pair are placed RELATIVE to the base,
+    // so the whole camp shifts down together, arrangement unchanged.
+    val towerBaseY = max(h * 0.16f + 9f, 330f)
     world.towers.add(Offset(w * 0.22f, towerBaseY))
     // Camp A decor: a tent below-right of the tower.
-    world.tents.add(Offset(w * 0.31f, h * 0.27f))
+    world.tents.add(Offset(w * 0.31f, towerBaseY + h * 0.10f))
     // Camp B decor (right side, near the canal): the smugglers' own
     // parked jeep, base point (bottom centre of the sprite).
     world.campJeep = Offset(w * 0.74f, h * 0.35f)
@@ -331,6 +373,10 @@ fun initWorld(world: GameWorld, w: Float, h: Float) {
         world.enemies.add(Enemy(w * fx, h * fy, phaseIdx * 1.37f))
         phaseIdx++
     }
+    fun addScoutAt(x: Float, y: Float) {
+        world.enemies.add(Enemy(x, y, phaseIdx * 1.37f))
+        phaseIdx++
+    }
     // Tower sentry: stands on the tower platform (feet 105 above the
     // tower base), standard enemy stats, never moves.
     val sentry = Enemy(w * 0.22f, towerBaseY - 105f, phaseIdx * 1.37f)
@@ -338,8 +384,8 @@ fun initWorld(world: GameWorld, w: Float, h: Float) {
     sentry.stationary = true
     world.enemies.add(sentry)
     // Camp A pair, posted around the tent and crate.
-    addScout(0.27f, 0.31f)
-    addScout(0.13f, 0.34f)
+    addScoutAt(w * 0.27f, towerBaseY + h * 0.14f)
+    addScoutAt(w * 0.13f, towerBaseY + h * 0.17f)
     // Camp B trio, around their jeep and crate.
     addScout(0.79f, 0.38f)
     addScout(0.63f, 0.31f)
@@ -348,9 +394,61 @@ fun initWorld(world: GameWorld, w: Float, h: Float) {
     addScout(0.38f, 0.52f)
     addScout(0.56f, 0.57f)
 
-    val crateSpots = listOf(0.15f to 0.26f, 0.67f to 0.40f, 0.47f to 0.49f)
+    // Camp A's crate rides with the camp (v0.6.1); the other two keep
+    // their v0.6.0 spots — Camp B's and the patrol pair's, the loose
+    // one sitting at the top edge of the wheat line (see plots below).
+    world.crates.add(CrateEnt(w * 0.15f, towerBaseY + h * 0.09f))
+    val crateSpots = listOf(0.67f to 0.40f, 0.47f to 0.49f)
     for (spot in crateSpots) {
         world.crates.add(CrateEnt(w * spot.first, h * spot.second))
+    }
+
+    // --- Explicit plot list (v0.6.1): dirt dominates. The old plot
+    // grid covered ~80% of the world; now 3 tended crop plots (~10%
+    // of the area) plus ONE wheat line at mid-field (~6%) are the
+    // only green/gold — everything else is mitti. The wheat line is
+    // 3 uneven patches with stepped "chip" rects breaking their
+    // edges; the patrol pair and the loose crate sit in/near it. ---
+    fun cropPlot(x0: Float, y0: Float, x1: Float, y1: Float) {
+        world.plots.add(Plot(w * x0, h * y0, w * x1, h * y1, wheat = false, main = true))
+    }
+    fun wheatPatch(x0: Float, y0: Float, x1: Float, y1: Float, main: Boolean) {
+        world.plots.add(Plot(w * x0, h * y0, w * x1, h * y1, wheat = true, main = main))
+    }
+    cropPlot(0.35f, 0.12f, 0.61f, 0.225f) // upper-middle-left
+    cropPlot(0.05f, 0.62f, 0.33f, 0.76f) // lower-left
+    cropPlot(0.62f, 0.56f, 0.86f, 0.685f) // mid-right, below Camp B
+    wheatPatch(0.04f, 0.505f, 0.22f, 0.615f, true)
+    wheatPatch(0.015f, 0.53f, 0.05f, 0.60f, false)
+    wheatPatch(0.19f, 0.475f, 0.235f, 0.545f, false)
+    wheatPatch(0.10f, 0.595f, 0.16f, 0.645f, false)
+    wheatPatch(0.26f, 0.49f, 0.50f, 0.585f, true)
+    wheatPatch(0.235f, 0.515f, 0.275f, 0.575f, false)
+    wheatPatch(0.475f, 0.465f, 0.515f, 0.53f, false)
+    wheatPatch(0.33f, 0.565f, 0.40f, 0.615f, false)
+    wheatPatch(0.545f, 0.52f, 0.695f, 0.65f, true)
+    wheatPatch(0.52f, 0.545f, 0.56f, 0.615f, false)
+    wheatPatch(0.665f, 0.495f, 0.71f, 0.565f, false)
+    wheatPatch(0.585f, 0.625f, 0.645f, 0.675f, false)
+
+    // --- Wild-grass tuft spots (v0.6.1): scattered on the dirt only —
+    // clear of the plots, the canal, both camps, the squad start and
+    // the intro jeep's drive line. Deterministic; variants cycle. ---
+    val tuftData = listOf(
+        Triple(0.07f, 0.09f, 52f), Triple(0.38f, 0.06f, 44f),
+        Triple(0.66f, 0.08f, 48f), Triple(0.80f, 0.20f, 56f),
+        Triple(0.05f, 0.44f, 40f), Triple(0.86f, 0.28f, 42f),
+        Triple(0.33f, 0.42f, 58f), Triple(0.60f, 0.44f, 38f),
+        Triple(0.40f, 0.70f, 54f), Triple(0.52f, 0.78f, 44f),
+        Triple(0.20f, 0.86f, 60f), Triple(0.70f, 0.84f, 48f),
+        Triple(0.87f, 0.74f, 50f), Triple(0.44f, 0.635f, 42f),
+        Triple(0.76f, 0.52f, 44f), Triple(0.04f, 0.26f, 44f),
+        Triple(0.48f, 0.28f, 50f), Triple(0.58f, 0.90f, 40f)
+    )
+    tuftData.forEachIndexed { i, t ->
+        world.tuftSpots.add(
+            TuftSpot(w * t.first, h * t.second, t.third, i % 4, i % 3 == 1)
+        )
     }
 
     // Trees (cover) and rocks (cover), as collision circles, placed so
@@ -495,6 +593,8 @@ fun spawnDeathBurst(world: GameWorld, x: Float, y: Float) {
 fun registerKill(world: GameWorld) {
     world.combo = if (world.comboTimer > 0f) world.combo + 1 else 1
     world.comboTimer = 2.5f
+    // Combo milestone chime (v0.6.1) at x3 and x5.
+    if (world.combo == 3 || world.combo == 5) world.feel?.combo()
 }
 
 fun killEnemy(world: GameWorld, e: Enemy) {
@@ -509,11 +609,13 @@ fun killEnemy(world: GameWorld, e: Enemy) {
     world.deaths.add(DeathFade(e.x, e.y, facing, 0.25f))
     spawnDeathBurst(world, e.x, e.y)
     registerKill(world)
+    world.feel?.kill()
 }
 
 /** Damage to an enemy from any source; shows the floating damage number. */
 fun damageEnemy(world: GameWorld, e: Enemy, dmg: Float) {
     if (!e.alive) return
+    world.feel?.hit()
     e.hp -= dmg
     e.flash = 0.06f
     if (e.hp <= 0f) {
@@ -527,6 +629,7 @@ fun damageEnemy(world: GameWorld, e: Enemy, dmg: Float) {
 
 /** Full destruction feedback for a crate: explosion, scorch, shake, drop. */
 fun onCrateDestroyed(world: GameWorld, c: CrateEnt) {
+    world.feel?.explosion()
     spawnExplosion(world, c.x, c.y, big = true)
     world.booms.add(Boom(c.x, c.y, 170f, 0.55f, 0.55f))
     world.scorches.add(Scorch(c.x, c.y + 8f, 44f, (c.x * 7f + c.y).toInt()))
@@ -562,6 +665,9 @@ fun damageMember(world: GameWorld, m: Member, dmg: Float) {
         m.hp = 0f
         m.down = true
         m.wasDowned = true
+        world.feel?.down()
+    } else {
+        world.feel?.hurt()
     }
 }
 
@@ -591,16 +697,20 @@ fun SarhadSquadApp() {
     // game screens; null = any asset failed, code art serves everywhere.
     val context = LocalContext.current
     val sprites = remember { loadSpriteAssets(context) }
+    // Sound + vibration (v0.6.1), created once here so the START tap
+    // can click and the same instance serves the game screen's world;
+    // null = audio unavailable, the game runs silent as before.
+    val feel = remember { try { GameFeel(context) } catch (e: Exception) { null } }
 
     when (screen) {
         Screen.TITLE -> TitleScreen(
             faction = faction,
             onFaction = { faction = it },
-            onStart = { session++; screen = Screen.GAME },
+            onStart = { feel?.click(); session++; screen = Screen.GAME },
             poster = sprites?.poster
         )
         Screen.GAME -> key(session) {
-            GameScreen(faction = faction, sprites = sprites) { v, s, cp, t ->
+            GameScreen(faction = faction, sprites = sprites, feel = feel) { v, s, cp, t ->
                 victory = v
                 stars = s
                 commandPoints = cp
@@ -855,9 +965,10 @@ fun ResultScreen(
 fun GameScreen(
     faction: Faction,
     sprites: SpriteAssets?,
+    feel: GameFeel? = null,
     onFinish: (Boolean, Int, Int, Float) -> Unit
 ) {
-    val world = remember { GameWorld() }
+    val world = remember { GameWorld().also { it.feel = feel } }
     val art = remember { buildPixelArt() }
     var frameTick by remember { mutableIntStateOf(0) }
     var holdOn by remember { mutableStateOf(false) }
@@ -901,6 +1012,7 @@ fun GameScreen(
         world.scorches.add(Scorch(center.x, center.y, 52f, (center.x * 3f + center.y).toInt()))
         world.shake = max(world.shake, 8f)
         world.grenadeCd = 6f
+        world.feel?.explosion()
     }
 
     fun handleTap(p: Offset) {
@@ -1065,6 +1177,7 @@ fun GameScreen(
                     world.effects.add(
                         Effect(FX_HIT, e.x, e.y, e.x, e.y, 0.08f, 0.08f)
                     )
+                    world.feel?.enemyShot()
                 }
             } else if (!e.stationary) {
                 val wx = e.ax + (cos((world.elapsed * 0.35f + e.phase).toDouble()) * 46.0).toFloat()
@@ -1113,6 +1226,7 @@ fun GameScreen(
             }
             if (fired) {
                 m.cd = m.fireInterval * if (world.rapidTimer > 0f) 0.6f else 1f
+                world.feel?.memberShot()
             }
         }
 
@@ -1215,6 +1329,7 @@ fun GameScreen(
             }
             if (!touched) continue
             kit.remove()
+            world.feel?.pickup()
             if (pk.kind == PICKUP_MEDKIT) {
                 val hurt = world.members
                     .filter { !it.down }
@@ -1246,11 +1361,13 @@ fun GameScreen(
             var stars = 1
             if (world.members.none { it.wasDowned }) stars++
             if (world.elapsed <= 150f) stars++
+            world.feel?.win()
             onFinish(true, stars, 50 + 25 * stars, world.elapsed)
             return
         }
         if (world.members.all { it.down }) {
             world.finished = true
+            world.feel?.lose()
             onFinish(false, 0, 0, world.elapsed)
         }
     }
@@ -1941,19 +2058,24 @@ private fun paintRoad(): ImageBitmap = pixelBitmap(64, 16) { p ->
 }
 
 /** Fence segment, native 16x12: one post + two dashed wire rows. */
-private fun paintFence(): ImageBitmap = pixelBitmap(16, 12) { p ->
-    val post = argb(0xFF3A3F44)
-    val postL = argb(0xFF5A6167)
+private fun paintFence(): ImageBitmap = pixelBitmap(16, 20) { p ->
+    // v0.6.1: the khamby (posts) are ~1.6x taller and thicker than the
+    // old 16x12 segment, dark wood with a visible cap; wires unchanged.
+    val post = argb(0xFF4A3421)
+    val postL = argb(0xFF6B4E2E)
+    val cap = argb(0xFF5D4128)
     val wire = argb(0xFF2E3338)
-    p.rect(1, 0, 3, 12, post)
-    p.rect(1, 0, 1, 12, postL)
+    p.rect(0, 0, 7, 3, cap) // cap overhangs the post on both sides
+    p.rect(1, 0, 1, 3, postL)
+    p.rect(1, 3, 5, 17, post)
+    p.rect(1, 3, 1, 17, postL)
     for (x in 0 until 16) {
-        if (x % 6 != 5) {
-            p.px(x, 3, wire)
+        if (x < 1 || x > 5) {
             p.px(x, 7, wire)
+            p.px(x, 14, wire)
         }
     }
-    p.px(6, 2, wire); p.px(12, 6, wire)
+    p.px(9, 6, wire); p.px(13, 13, wire)
 }
 
 /** Medkit pickup icon, native 14x14: white box, red cross. */
@@ -2091,7 +2213,12 @@ class SpriteAssets(
     val texCrop: ImageBitmap,
     val tent: ImageBitmap,
     val jeep: ImageBitmap,
-    val poster: ImageBitmap
+    val poster: ImageBitmap,
+    // v0.6.1: wild-grass tuft atlas (256x256 = 2x2 cells of 128px,
+    // figures anchored bottom-centre), pre-cropped like the soldiers,
+    // plus a mirrored set for the flipped spots.
+    val tufts: Array<ImageBitmap>,
+    val tuftsFlip: Array<ImageBitmap>
 )
 
 private fun loadSpriteAssets(context: Context): SpriteAssets? {
@@ -2120,6 +2247,17 @@ private fun loadSpriteAssets(context: Context): SpriteAssets? {
             )
         }
 
+        fun tuftCells(name: String): Pair<Array<ImageBitmap>, Array<ImageBitmap>> {
+            val sheet = load(name)
+            fun cell(col: Int, row: Int): ImageBitmap =
+                Bitmap.createBitmap(sheet, col * 128, row * 128, 128, 128)
+                    .asImageBitmap()
+            val cells = Array(4) { i -> cell(i % 2, i / 2) }
+            val flips = Array(4) { i -> mirrorBitmap(cells[i]) }
+            return cells to flips
+        }
+        val tuftPair = tuftCells("tufts.b64")
+
         SpriteAssets(
             pak = atlas("atlas_pak.b64"),
             ind = atlas("atlas_india.b64"),
@@ -2134,10 +2272,232 @@ private fun loadSpriteAssets(context: Context): SpriteAssets? {
             texCrop = load("tex_crop.b64").asImageBitmap(),
             tent = load("tent.b64").asImageBitmap(),
             jeep = load("jeep.b64").asImageBitmap(),
-            poster = load("poster.b64").asImageBitmap()
+            poster = load("poster.b64").asImageBitmap(),
+            tufts = tuftPair.first,
+            tuftsFlip = tuftPair.second
         )
     } catch (e: Exception) {
         null
+    }
+}
+
+// --- Sound + vibration (v0.6.1) ---------------------------------------------
+// GameFeel synthesizes every effect from plain math (noise bursts, sine
+// sweeps, note melodies) into small WAV files in the cache dir, once,
+// then plays them through a SoundPool. No audio assets, no settings.
+// EVERY entry point is wrapped in try/catch: audio or vibration can
+// fail for any reason and the game must never notice.
+
+class GameFeel(context: Context) {
+    private var pool: SoundPool? = null
+    private val ids = HashMap<String, Int>()
+    private val lastPlayMs = HashMap<String, Long>()
+    private val vibrator: Vibrator? = try {
+        context.getSystemService(Vibrator::class.java)
+    } catch (e: Exception) {
+        null
+    }
+
+    init {
+        try {
+            val dir = File(context.cacheDir, "sarhad_sfx")
+            if (!dir.exists()) dir.mkdirs()
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_GAME)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            val sp = SoundPool.Builder()
+                .setMaxStreams(8)
+                .setAudioAttributes(attrs)
+                .build()
+            for ((name, samples) in synthAll()) {
+                val file = File(dir, "$name.wav")
+                writeWav(file, samples)
+                ids[name] = sp.load(file.absolutePath, 1)
+            }
+            pool = sp
+        } catch (e: Exception) {
+            pool = null
+        }
+    }
+
+    private fun play(name: String, volume: Float, rate: Float, minGapMs: Long) {
+        try {
+            val sp = pool ?: return
+            val id = ids[name] ?: return
+            val now = System.currentTimeMillis()
+            if (now - (lastPlayMs[name] ?: 0L) < minGapMs) return
+            lastPlayMs[name] = now
+            val v = (MASTER_VOL * volume).coerceIn(0f, 1f)
+            sp.play(id, v, v, 1, 0, rate)
+        } catch (e: Exception) {
+            // Silent by design.
+        }
+    }
+
+    private fun vibrate(ms: Long) {
+        try {
+            vibrator?.vibrate(
+                VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE)
+            )
+        } catch (e: Exception) {
+            // Silent by design.
+        }
+    }
+
+    fun memberShot() = play(
+        "memberShot", 1f, 0.95f + Random.nextFloat() * 0.13f, SHOT_GAP_MS
+    )
+
+    fun enemyShot() = play(
+        "enemyShot", 0.5f, 0.95f + Random.nextFloat() * 0.10f, SHOT_GAP_MS
+    )
+
+    fun hit() = play("hitTick", 0.8f, 1f, SHOT_GAP_MS)
+    fun kill() = play("killPop", 0.9f, 1f, SHOT_GAP_MS)
+    fun hurt() = play("memberHurt", 0.9f, 1f, 120L)
+    fun pickup() = play("pickup", 0.9f, 1f, SHOT_GAP_MS)
+    fun combo() = play("comboUp", 0.9f, 1f, SHOT_GAP_MS)
+    fun click() = play("uiClick", 0.8f, 1f, SHOT_GAP_MS)
+    fun win() = play("win", 1f, 1f, 0L)
+    fun lose() = play("lose", 1f, 1f, 0L)
+
+    /** Explosion sound + a short buzz. The 80 ms gap only stops the
+     * same blast stacking on itself (grenade + crates it destroys);
+     * distinct blasts are seconds apart and always play. */
+    fun explosion() {
+        play("explosion", 1f, 1f, 80L)
+        vibrate(70L)
+    }
+
+    /** Member-down sting + a longer buzz. */
+    fun down() {
+        play("memberDown", 1f, 1f, SHOT_GAP_MS)
+        vibrate(120L)
+    }
+
+    companion object {
+        private const val SR = 22050
+        private const val MASTER_VOL = 0.55f
+        private const val SHOT_GAP_MS = 45L
+
+        /** White noise through a one-pole lowpass ([dark]: 1 = bright
+         * crack, low = dark rumble) under an exponential decay. */
+        private fun noiseBurst(
+            dur: Float, tau: Float, dark: Float, seed: Int, gain: Float
+        ): FloatArray {
+            val n = (dur * SR).toInt().coerceAtLeast(1)
+            val out = FloatArray(n)
+            val rnd = Random(seed)
+            var lp = 0f
+            for (i in 0 until n) {
+                val t = i.toFloat() / SR
+                val white = rnd.nextFloat() * 2f - 1f
+                lp += dark * (white - lp)
+                out[i] = (lp * exp(-t / tau) * gain).coerceIn(-1f, 1f)
+            }
+            return out
+        }
+
+        /** Sine whose pitch glides from f0 to f1 over [dur]. */
+        private fun sweep(
+            f0: Float, f1: Float, dur: Float, tau: Float, gain: Float
+        ): FloatArray {
+            val n = (dur * SR).toInt().coerceAtLeast(1)
+            val out = FloatArray(n)
+            var phase = 0.0
+            for (i in 0 until n) {
+                val t = i.toFloat() / SR
+                val f = f0 + (f1 - f0) * (t / dur)
+                phase += 2.0 * Math.PI * f / SR
+                out[i] = (sin(phase).toFloat() * exp(-t / tau) * gain)
+                    .coerceIn(-1f, 1f)
+            }
+            return out
+        }
+
+        /** Sequential sine notes, each with a quick attack and decay. */
+        private fun melody(freqs: FloatArray, noteDur: Float, gain: Float): FloatArray {
+            val per = (noteDur * SR).toInt().coerceAtLeast(1)
+            val out = FloatArray(per * freqs.size)
+            for (k in freqs.indices) {
+                var phase = 0.0
+                for (i in 0 until per) {
+                    val t = i.toFloat() / SR
+                    phase += 2.0 * Math.PI * freqs[k] / SR
+                    val attack = min(1f, t / 0.012f)
+                    val env = exp(-t / (noteDur * 0.9f)) * (0.4f + 0.6f * attack)
+                    out[k * per + i] = (sin(phase).toFloat() * env * gain)
+                        .coerceIn(-1f, 1f)
+                }
+            }
+            return out
+        }
+
+        private fun mix(a: FloatArray, b: FloatArray): FloatArray {
+            val n = max(a.size, b.size)
+            val out = FloatArray(n)
+            for (i in 0 until n) {
+                val s = (if (i < a.size) a[i] else 0f) +
+                    (if (i < b.size) b[i] else 0f)
+                out[i] = s.coerceIn(-1f, 1f)
+            }
+            return out
+        }
+
+        private fun synthAll(): Map<String, FloatArray> = mapOf(
+            "memberShot" to noiseBurst(0.07f, 0.020f, 0.85f, 11, 1.15f),
+            "enemyShot" to noiseBurst(0.09f, 0.030f, 0.35f, 23, 2.1f),
+            "hitTick" to noiseBurst(0.03f, 0.008f, 0.50f, 37, 2.2f),
+            "killPop" to sweep(700f, 120f, 0.12f, 0.05f, 0.9f),
+            "explosion" to mix(
+                noiseBurst(0.50f, 0.16f, 0.16f, 41, 3.0f),
+                sweep(160f, 40f, 0.50f, 0.20f, 0.7f)
+            ),
+            "memberHurt" to mix(
+                noiseBurst(0.08f, 0.030f, 0.30f, 53, 2.0f),
+                sweep(220f, 90f, 0.08f, 0.040f, 0.7f)
+            ),
+            "memberDown" to melody(floatArrayOf(520f, 390f, 260f), 0.12f, 0.55f),
+            "pickup" to melody(floatArrayOf(880f, 1320f), 0.06f, 0.55f),
+            "comboUp" to melody(floatArrayOf(660f, 880f, 1100f), 0.05f, 0.55f),
+            "win" to melody(floatArrayOf(523f, 659f, 784f), 0.20f, 0.55f),
+            "lose" to melody(floatArrayOf(392f, 330f, 262f), 0.20f, 0.55f),
+            "uiClick" to sweep(1150f, 900f, 0.03f, 0.012f, 0.5f)
+        )
+
+        /** Minimal 16-bit mono PCM WAV writer (header built by hand). */
+        private fun writeWav(file: File, samples: FloatArray) {
+            val dataSize = samples.size * 2
+            val header = ByteArray(44)
+            fun putStr(off: Int, s: String) {
+                for (i in s.indices) header[off + i] = s[i].code.toByte()
+            }
+            fun putInt(off: Int, v: Int) {
+                header[off] = (v and 0xFF).toByte()
+                header[off + 1] = ((v shr 8) and 0xFF).toByte()
+                header[off + 2] = ((v shr 16) and 0xFF).toByte()
+                header[off + 3] = ((v shr 24) and 0xFF).toByte()
+            }
+            fun putShort(off: Int, v: Int) {
+                header[off] = (v and 0xFF).toByte()
+                header[off + 1] = ((v shr 8) and 0xFF).toByte()
+            }
+            putStr(0, "RIFF"); putInt(4, 36 + dataSize); putStr(8, "WAVE")
+            putStr(12, "fmt "); putInt(16, 16); putShort(20, 1); putShort(22, 1)
+            putInt(24, SR); putInt(28, SR * 2); putShort(32, 2); putShort(34, 16)
+            putStr(36, "data"); putInt(40, dataSize)
+            FileOutputStream(file).use { out ->
+                out.write(header)
+                val buf = ByteArray(dataSize)
+                for (i in samples.indices) {
+                    val v = (samples[i].coerceIn(-1f, 1f) * 32767f).toInt()
+                    buf[i * 2] = (v and 0xFF).toByte()
+                    buf[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+                }
+                out.write(buf)
+            }
+        }
     }
 }
 
@@ -2264,11 +2624,16 @@ fun DrawScope.drawTree(art: PixelArt, o: Obstacle, assets: SpriteAssets? = null)
     }
 }
 
-/** Rock sprite (native 24x14 drawn 72x42). */
+/** Warm brown-grey multiply tint for the rocks (v0.6.1) — the raw
+ * sprite is near-greyscale and read as grey saucers on the dirt. */
+private val ROCK_TINT_FILTER: ColorFilter =
+    ColorFilter.tint(Color(0xFFC7A887), BlendMode.Modulate)
+
+/** Rock sprite (native 24x14; v0.6.1: drawn 58x34 = 0.8x, tinted). */
 fun DrawScope.drawRock(art: PixelArt, o: Obstacle) {
     val bottom = o.y + o.r * 0.72f
     drawShadow(o.x, bottom - 1f, o.r * 1.0f, o.r * 0.30f)
-    blit(art.rock, o.x - 36f, bottom - 42f, 72, 42)
+    blit(art.rock, o.x - 29f, bottom - 34f, 58, 34, colorFilter = ROCK_TINT_FILTER)
 }
 
 /** Crate sprite (native 24x24 drawn 72x72); destroyed = faded. */
@@ -2299,7 +2664,8 @@ fun DrawScope.drawStandingFigure(
     moving: Boolean,
     set: Map<PixelFacing, Array<ImageBitmap>>,
     alpha: Float = 1f,
-    flash: Boolean = false
+    flash: Boolean = false,
+    scale: Float = 1f
 ) {
     val pixelFacing = if (kotlin.math.abs(facing.y) >= kotlin.math.abs(facing.x)) {
         if (facing.y >= 0f) PixelFacing.DOWN else PixelFacing.UP
@@ -2309,9 +2675,11 @@ fun DrawScope.drawStandingFigure(
     val frame = if (moving) {
         (kotlin.math.floor(stepPhase / Math.PI).toInt() and 1)
     } else 0
-    drawShadow(x, groundY + 4f, 23f, 5f)
+    drawShadow(x, groundY + 4f, 23f * scale, 5f)
     blit(
-        set.getValue(pixelFacing)[frame], x - 38f, groundY - 95f, 76, 95,
+        set.getValue(pixelFacing)[frame],
+        x - 38f * scale, groundY - 95f * scale,
+        (76f * scale).toInt(), (95f * scale).toInt(),
         alpha = alpha,
         colorFilter = if (flash) HIT_FLASH_FILTER else null
     )
@@ -2334,7 +2702,8 @@ fun DrawScope.drawAtlasFigure(
     moving: Boolean,
     set: Map<PixelFacing, Array<ImageBitmap>>,
     alpha: Float = 1f,
-    flash: Boolean = false
+    flash: Boolean = false,
+    scale: Float = 1f
 ) {
     val pixelFacing = if (kotlin.math.abs(facing.y) >= kotlin.math.abs(facing.x)) {
         if (facing.y >= 0f) PixelFacing.DOWN else PixelFacing.UP
@@ -2345,9 +2714,10 @@ fun DrawScope.drawAtlasFigure(
     val frame = if (moving) {
         Math.floorMod((elapsed * 7f + phase).toInt(), frames.size)
     } else 0
-    drawShadow(x, groundY + 4f, 23f, 5f)
+    drawShadow(x, groundY + 4f, 23f * scale, 5f)
+    val dst = (104f * scale).toInt()
     blit(
-        frames[frame], x - 52f, groundY - 104f, 104, 104,
+        frames[frame], x - 52f * scale, groundY - 104f * scale, dst, dst,
         alpha = alpha,
         colorFilter = if (flash) HIT_FLASH_FILTER else null
     )
@@ -2484,47 +2854,17 @@ private fun DrawScope.drawGameWorld(
     val w = world.w
     val h = world.h
 
-    // ---- Ground layer: dirt base, plots, road, canal, fence. ----
-    // Plot kinds by the same index formula as the old colour palette:
-    // 0 = green crop, 1 = light crop, 2 = wheat.
-    val kindOf = listOf(0, 1, 2, 0, 1, 0)
-    val cols = 4
-    val rows = 6
-    val cellW = w / cols
-    val cellH = h / rows
+    // ---- Ground layer: dirt base, plots, tufts, canal, fence. ----
+    // v0.6.1: the plot list is explicit and shared by both art paths
+    // (world.plots, built in initWorld) — dirt dominates, with 3 crop
+    // plots and one broken wheat line as the only fields. The old
+    // 4x6 plot grid is gone.
     if (assets != null) {
-        // Dirt-dominant ground (v0.6.0): the real dirt texture IS the
-        // ground, stretched over the whole world — the field is mostly
-        // mitti now, with crop/wheat plots as patches on it. The old
-        // separate road strip is dropped; the dirt carries the scene.
+        // The real dirt texture IS the ground, stretched over the
+        // whole world. (Road strip dropped, as in v0.6.0.)
         stretch(assets.texDirt, 0f, 0f, w, h)
-        for (i in 0 until cols) {
-            for (j in 0 until rows) {
-                val kind = kindOf[(i * 3 + j * 5 + i * j) % kindOf.size]
-                val x0 = i * cellW + 4f
-                val y0 = j * cellH + 4f
-                val x1 = (i + 1) * cellW - 4f
-                val y1 = (j + 1) * cellH - 4f
-                stretch(
-                    if (kind == 2) assets.texWheat else assets.texCrop,
-                    x0, y0, x1, y1
-                )
-                drawRect(
-                    color = Color(0xFF5D4630).copy(alpha = 0.50f),
-                    topLeft = Offset(x0, y0),
-                    size = Size(x1 - x0, y1 - y0),
-                    style = Stroke(width = 3f)
-                )
-                drawRect(
-                    color = Color.Black.copy(alpha = 0.18f),
-                    topLeft = Offset(x0, y1 - 5f),
-                    size = Size(x1 - x0, 5f)
-                )
-            }
-        }
     } else {
-        // Fallback ground (v0.5.0 behaviour, untouched): code-drawn
-        // dirt tiles under fully textured plots, plus the road strip.
+        // Fallback base: code-drawn dirt tiles over everything.
         var dirtY = 0f
         while (dirtY < h) {
             var dirtX = 0f
@@ -2534,42 +2874,55 @@ private fun DrawScope.drawGameWorld(
             }
             dirtY += 192f
         }
-        for (i in 0 until cols) {
-            for (j in 0 until rows) {
-                val kind = kindOf[(i * 3 + j * 5 + i * j) % kindOf.size]
-                val variant = (i + j) % 2
-                val bmp = when (kind) {
-                    0 -> if (variant == 0) art.cropA else art.cropB
-                    1 -> if (variant == 0) art.lightA else art.lightB
-                    else -> if (variant == 0) art.wheatA else art.wheatB
-                }
-                val x0 = i * cellW + 4f
-                val y0 = j * cellH + 4f
-                val x1 = (i + 1) * cellW - 4f
-                val y1 = (j + 1) * cellH - 4f
-                tileRect(bmp, x0, y0, x1, y1)
-                drawRect(
-                    color = Color(0xFF5D4630).copy(alpha = 0.50f),
-                    topLeft = Offset(x0, y0),
-                    size = Size(x1 - x0, y1 - y0),
-                    style = Stroke(width = 3f)
-                )
-                drawRect(
-                    color = Color.Black.copy(alpha = 0.18f),
-                    topLeft = Offset(x0, y1 - 5f),
-                    size = Size(x1 - x0, 5f)
-                )
+    }
+    world.plots.forEachIndexed { idx, p ->
+        if (assets != null) {
+            stretch(
+                if (p.wheat) assets.texWheat else assets.texCrop,
+                p.x0, p.y0, p.x1, p.y1
+            )
+        } else {
+            val bmp = if (p.wheat) {
+                if (idx % 2 == 0) art.wheatA else art.wheatB
+            } else {
+                if (idx % 2 == 0) art.cropA else art.cropB
             }
+            tileRect(bmp, p.x0, p.y0, p.x1, p.y1)
         }
-
-        // Dirt road: bitmap strip (native 64x16 drawn 192x48).
+        if (p.main) {
+            drawRect(
+                color = Color(0xFF5D4630).copy(alpha = 0.50f),
+                topLeft = Offset(p.x0, p.y0),
+                size = Size(p.x1 - p.x0, p.y1 - p.y0),
+                style = Stroke(width = 3f)
+            )
+            drawRect(
+                color = Color.Black.copy(alpha = 0.18f),
+                topLeft = Offset(p.x0, p.y1 - 5f),
+                size = Size(p.x1 - p.x0, 5f)
+            )
+        }
+    }
+    // Wild-grass tufts on the dirt (real-art path): above the ground,
+    // below everything else, no depth sort.
+    if (assets != null) {
+        for (t in world.tuftSpots) {
+            val bmp = if (t.flip) assets.tuftsFlip[t.variant] else assets.tufts[t.variant]
+            blit(bmp, t.x - t.size / 2f, t.y - t.size, t.size.toInt(), t.size.toInt())
+        }
+    }
+    if (assets == null) {
+        // Dirt road (fallback path only, v0.5.0 behaviour): bitmap
+        // strip (native 64x16 drawn 192x48).
         val roadY = h * 0.545f
         tileRect(art.road, 0f, roadY, w, roadY + 42f, tileW = 192, tileH = 48)
     }
 
     // Canal along the right side: two baked variants alternate down the
-    // strip, mud banks at both edges.
-    val cx0 = w * 0.865f
+    // strip, mud banks at both edges. v0.6.1: narrowed to 60% of its
+    // old width (0.075w -> 0.045w), right edge unchanged, so Camp B
+    // and its jeep keep their land with room to spare.
+    val cx0 = w * 0.895f
     val cx1 = w * 0.94f
     clipRect(left = cx0, top = 0f, right = cx1, bottom = h) {
         var cy = 0f
@@ -2585,10 +2938,15 @@ private fun DrawScope.drawGameWorld(
     }
 
     // Border fence: bitmap segment (post + dashed wires) tiled across.
-    val fenceBase = h * 0.16f + 9f
+    // Its base line is the watchtower's base (initWorld), so the tower
+    // always stands on the fence — including after the v0.6.1 Camp A
+    // shift. The segment is drawn 48x60 (the v0.6.1 bitmap is 16x20:
+    // taller, thicker capped posts), bottom edge on the old ground
+    // line (fenceBase + 8).
+    val fenceBase = world.towers.firstOrNull()?.y ?: (h * 0.16f + 9f)
     var fenceX = 0f
     while (fenceX < w) {
-        blit(art.fence, fenceX, fenceBase - 28f, 48, 36)
+        blit(art.fence, fenceX, fenceBase - 52f, 48, 60)
         fenceX += 48f
     }
 
@@ -2686,20 +3044,24 @@ private fun DrawScope.drawGameWorld(
         // draws AFTER (above) the tower sprite, standing on its
         // platform, even though his feet are 105 units higher.
         val eSortKey = if (e.stationary) e.y + 110f else e.y
+        // v0.6.1: the sentry is drawn at 0.78 scale — same man, same
+        // stats, but he read oversized standing on the tower. His
+        // position (and so his bullet origin) is untouched.
+        val eScale = if (e.stationary) 0.78f else 1f
         drawables.add(eSortKey to {
             if (assets != null) {
                 drawAtlasFigure(
                     e.x, e.y, eFacing, world.elapsed, e.phase, eMoving,
-                    assets.smuggler, flash = e.flash > 0f
+                    assets.smuggler, flash = e.flash > 0f, scale = eScale
                 )
             } else {
                 drawStandingFigure(
                     e.x, e.y, eFacing, world.elapsed * 7f + e.phase, eMoving, art.enemy,
-                    flash = e.flash > 0f
+                    flash = e.flash > 0f, scale = eScale
                 )
             }
             if (e.hp < e.maxHp) {
-                drawHealthBar(e.x, e.y - 108f, e.hp / e.maxHp, 34f)
+                drawHealthBar(e.x, e.y - 108f * eScale, e.hp / e.maxHp, 34f)
             }
         })
     }
