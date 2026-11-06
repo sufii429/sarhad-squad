@@ -1,0 +1,24 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Flag pole -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,18 L34,18 L34,90 L30,90 Z" />
+    <!-- Flag -->
+    <path
+        android:fillColor="#FFC107"
+        android:pathData="M34,20 L64,28 L34,36 Z" />
+    <!-- Three squad heads -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,52 m-8,0 a8,8 0 1,0 16,0 a8,8 0 1,0 -16,0 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M40,68 m-7,0 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M70,68 m-7,0 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0 Z" />
+</vector>
