@@ -12,6 +12,7 @@ import android.graphics.Typeface
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -35,7 +36,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.withFrameMillis
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -55,7 +56,9 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontStyle
@@ -66,6 +69,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
@@ -73,7 +77,7 @@ import kotlin.math.sqrt
 import kotlin.random.Random
 
 // ============================================================================
-// Sarhad Squad: Border War — Mission 1 prototype (v0.5.0)
+// Sarhad Squad: Border War — Mission 1 prototype (v0.6.0)
 // Pixel-art squad shooter. TITLE -> GAME -> RESULT state machine.
 // v0.4.0 adds the Stage-1 Feel Pack: visible projectiles, explosion
 // feedback + scorch marks, Canvas damage numbers, combo counter, range
@@ -83,6 +87,11 @@ import kotlin.random.Random
 // base64 text files (<name>.b64) decoded at runtime, because the repo
 // push tool only accepts text. If any asset fails to load, the
 // code-drawn pixel art remains as the fallback.
+// v0.6.0: dirt-dominant ground with real dirt/wheat/crop textures,
+// Mission 1 regrouped into smuggler camps (tents, a parked jeep, a
+// watchtower sentry), a jeep-arrival intro, a pointer-id joystick that
+// cannot be stolen or dropped, a frame-clock loop with stick smoothing,
+// and the poster title screen.
 // All in-game text is English only.
 // ============================================================================
 
@@ -144,6 +153,8 @@ class Enemy(val ax: Float, val ay: Float, val phase: Float) {
     var cd = 0f
     var alive = true
     var flash = 0f // hit-flash timer (white tint while > 0)
+    // Tower sentry (v0.6.0): never patrols or approaches, only fires.
+    var stationary = false
 }
 
 class CrateEnt(var x: Float, var y: Float) {
@@ -248,7 +259,41 @@ class GameWorld {
     var pickupAlt = false
     var flashText = ""
     var flashTtl = 0f
+    // Camp layout anchors (v0.6.0): base points shared by placement and
+    // drawing. Tents / the camp jeep are pure decor (drawn only when the
+    // real sprite assets loaded); towers exist in both art paths.
+    val towers = mutableListOf<Offset>()
+    val tents = mutableListOf<Offset>()
+    var campJeep: Offset? = null
+    // Jeep-arrival intro (v0.6.0, real-art path only). The jeep drives
+    // from jeepStartY up to the drop point, the squad steps out and
+    // walks into formation, then control starts. INTRO_LEN total.
+    var intro = false
+    var introT = 0f
+    var jeepX = 0f
+    var jeepY = 0f
+    var jeepDropX = 0f
+    var jeepDropY = 0f
+    var jeepStartY = 0f
+
+    /** Snap the intro to its end state (tap to skip / fallback path). */
+    fun finishIntro() {
+        if (!intro) return
+        intro = false
+        introT = INTRO_LEN
+        jeepX = jeepDropX
+        jeepY = jeepDropY
+        for (m in members) {
+            m.x = anchorX + m.offX
+            m.y = anchorY + m.offY
+        }
+    }
 }
+
+// Jeep intro timing (v0.6.0): drive, step-out walk, settle.
+const val INTRO_LEN = 2.4f
+const val INTRO_DRIVE_END = 1.7f
+const val INTRO_WALK_LEN = 0.5f
 
 /** Spawn everything as fractions of the canvas size, once the size is known. */
 fun initWorld(world: GameWorld, w: Float, h: Float) {
@@ -269,30 +314,68 @@ fun initWorld(world: GameWorld, w: Float, h: Float) {
         world.members.add(m)
     }
 
-    val enemySpots = listOf(
-        0.18f to 0.30f, 0.42f to 0.26f, 0.66f to 0.32f, 0.30f to 0.44f,
-        0.55f to 0.47f, 0.78f to 0.42f, 0.24f to 0.62f, 0.62f to 0.64f
-    )
-    enemySpots.forEachIndexed { i, spot ->
-        world.enemies.add(Enemy(w * spot.first, h * spot.second, i * 1.37f))
-    }
+    // --- Mission 1 regrouped into smuggler camps (v0.6.0). Same totals
+    // as before: 8 scouts (one is the tower sentry) and 3 crates. ---
+    // Watchtower on the fence line, anchoring Camp A (upper-left). Its
+    // base point is shared with the draw code and the sentry spawn.
+    val towerBaseY = h * 0.16f + 9f
+    world.towers.add(Offset(w * 0.22f, towerBaseY))
+    // Camp A decor: a tent below-right of the tower.
+    world.tents.add(Offset(w * 0.31f, h * 0.27f))
+    // Camp B decor (right side, near the canal): the smugglers' own
+    // parked jeep, base point (bottom centre of the sprite).
+    world.campJeep = Offset(w * 0.74f, h * 0.35f)
 
-    val crateSpots = listOf(0.35f to 0.34f, 0.58f to 0.55f, 0.72f to 0.66f)
+    var phaseIdx = 0
+    fun addScout(fx: Float, fy: Float) {
+        world.enemies.add(Enemy(w * fx, h * fy, phaseIdx * 1.37f))
+        phaseIdx++
+    }
+    // Tower sentry: stands on the tower platform (feet 105 above the
+    // tower base), standard enemy stats, never moves.
+    val sentry = Enemy(w * 0.22f, towerBaseY - 105f, phaseIdx * 1.37f)
+    phaseIdx++
+    sentry.stationary = true
+    world.enemies.add(sentry)
+    // Camp A pair, posted around the tent and crate.
+    addScout(0.27f, 0.31f)
+    addScout(0.13f, 0.34f)
+    // Camp B trio, around their jeep and crate.
+    addScout(0.79f, 0.38f)
+    addScout(0.63f, 0.31f)
+    addScout(0.71f, 0.45f)
+    // Patrol pair on the mid-field path, with the third crate.
+    addScout(0.38f, 0.52f)
+    addScout(0.56f, 0.57f)
+
+    val crateSpots = listOf(0.15f to 0.26f, 0.67f to 0.40f, 0.47f to 0.49f)
     for (spot in crateSpots) {
         world.crates.add(CrateEnt(w * spot.first, h * spot.second))
     }
 
-    // Trees (cover) and rocks (cover), as collision circles.
+    // Trees (cover) and rocks (cover), as collision circles, placed so
+    // the camps read as places: cover at the camp edges and mid-field.
     val trees = listOf(
-        Triple(0.12f, 0.40f, 26f), Triple(0.48f, 0.36f, 30f),
-        Triple(0.80f, 0.58f, 26f), Triple(0.38f, 0.70f, 28f),
-        Triple(0.66f, 0.22f, 24f)
+        Triple(0.08f, 0.20f, 24f), Triple(0.60f, 0.22f, 26f),
+        Triple(0.83f, 0.50f, 24f), Triple(0.30f, 0.66f, 28f),
+        Triple(0.58f, 0.71f, 26f)
     )
     for (t in trees) world.obstacles.add(Obstacle(w * t.first, h * t.second, t.third, true))
     val rocks = listOf(
-        Triple(0.20f, 0.52f, 18f), Triple(0.52f, 0.62f, 20f), Triple(0.74f, 0.34f, 16f)
+        Triple(0.47f, 0.36f, 18f), Triple(0.16f, 0.52f, 16f), Triple(0.66f, 0.60f, 20f)
     )
     for (r in rocks) world.obstacles.add(Obstacle(w * r.first, h * r.second, r.third, false))
+
+    // Jeep-arrival intro setup: the jeep starts below the world and
+    // stops left of the formation; the squad steps out of it. The
+    // fallback art path cancels the intro in GameScreen.
+    world.jeepDropX = world.anchorX - 120f
+    world.jeepDropY = world.anchorY + 16f
+    world.jeepStartY = h + 140f
+    world.jeepX = world.jeepDropX
+    world.jeepY = world.jeepStartY
+    world.intro = true
+    world.introT = 0f
 
     world.initialized = true
 }
@@ -504,15 +587,20 @@ fun SarhadSquadApp() {
     var stars by remember { mutableIntStateOf(0) }
     var commandPoints by remember { mutableIntStateOf(0) }
     var finalTime by remember { mutableFloatStateOf(0f) }
+    // Real sprite art (v0.5.0), loaded once and shared by the title and
+    // game screens; null = any asset failed, code art serves everywhere.
+    val context = LocalContext.current
+    val sprites = remember { loadSpriteAssets(context) }
 
     when (screen) {
         Screen.TITLE -> TitleScreen(
             faction = faction,
             onFaction = { faction = it },
-            onStart = { session++; screen = Screen.GAME }
+            onStart = { session++; screen = Screen.GAME },
+            poster = sprites?.poster
         )
         Screen.GAME -> key(session) {
-            GameScreen(faction = faction) { v, s, cp, t ->
+            GameScreen(faction = faction, sprites = sprites) { v, s, cp, t ->
                 victory = v
                 stars = s
                 commandPoints = cp
@@ -534,7 +622,94 @@ fun SarhadSquadApp() {
 // --- TITLE -------------------------------------------------------------------
 
 @Composable
-fun TitleScreen(faction: Faction, onFaction: (Faction) -> Unit, onStart: () -> Unit) {
+fun TitleScreen(
+    faction: Faction,
+    onFaction: (Faction) -> Unit,
+    onStart: () -> Unit,
+    poster: ImageBitmap? = null
+) {
+    // Poster title (v0.6.0): the poster art carries the game title, so
+    // no big text title is drawn over it — just the side picker, the
+    // mission brief and START in a shaded panel at the bottom.
+    if (poster != null) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xFF101A0B))
+        ) {
+            Image(
+                bitmap = poster,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+                alignment = Alignment.TopCenter
+            )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(Color.Transparent, Color(0xF20A1206))
+                        )
+                    )
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 24.dp, end = 24.dp, top = 56.dp, bottom = 28.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        "CHOOSE YOUR SIDE",
+                        color = Color(0xFF9DB38F),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Button(
+                            onClick = { onFaction(Faction.PAKISTAN) },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (faction == Faction.PAKISTAN)
+                                    Color(0xFF046A38) else Color(0xFF3A4A38)
+                            )
+                        ) { Text("PAKISTAN") }
+                        Button(
+                            onClick = { onFaction(Faction.INDIA) },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (faction == Faction.INDIA)
+                                    Color(0xFFB26A1B) else Color(0xFF3A4A38)
+                            )
+                        ) { Text("INDIA") }
+                    }
+                    Spacer(Modifier.height(20.dp))
+                    Text(
+                        "MISSION 1 — DAWN PATROL",
+                        color = Color.White,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Clear 8 smuggler scouts and destroy 3 supply crates.",
+                        color = Color(0xFFCFD8C3),
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Button(
+                        onClick = onStart,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFFC62828)
+                        )
+                    ) { Text("START MISSION", fontSize = 15.sp) }
+                }
+            }
+        }
+        return
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -677,19 +852,23 @@ fun ResultScreen(
 // --- GAME --------------------------------------------------------------------
 
 @Composable
-fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
+fun GameScreen(
+    faction: Faction,
+    sprites: SpriteAssets?,
+    onFinish: (Boolean, Int, Int, Float) -> Unit
+) {
     val world = remember { GameWorld() }
     val art = remember { buildPixelArt() }
-    val context = LocalContext.current
-    // Real sprite art (v0.5.0); null = any asset failed, code art serves.
-    val sprites = remember { loadSpriteAssets(context) }
     var frameTick by remember { mutableIntStateOf(0) }
     var holdOn by remember { mutableStateOf(false) }
+    // joyVec is the smoothed stick vector the game actually reads;
+    // joyTarget is the raw vector the pointer handler writes (v0.6.0).
     var joyVec by remember { mutableStateOf(Offset.Zero) }
+    var joyTarget by remember { mutableStateOf(Offset.Zero) }
     var joyBase by remember { mutableStateOf<Offset?>(null) }
 
     fun throwGrenade() {
-        if (!world.initialized || world.finished || world.grenadeCd > 0f) return
+        if (!world.initialized || world.finished || world.intro || world.grenadeCd > 0f) return
         // Target the densest cluster of live enemies within blast reach.
         var bestCenter: Offset? = null
         var bestCount = -1
@@ -740,6 +919,60 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
 
     fun stepGame(dt: Float) {
         if (!world.initialized || world.finished) return
+        // -- Jeep-arrival intro (v0.6.0): the world is frozen except the
+        // jeep, its dust and the step-out walk. The mission timer (and
+        // everything else) only starts when the intro ends. --
+        if (world.intro) {
+            world.introT += dt
+            val t = world.introT
+            val driveT = (t / INTRO_DRIVE_END).coerceIn(0f, 1f)
+            val inv = 1f - driveT
+            val ease = 1f - inv * inv * inv // cubic ease-out stop
+            world.jeepX = world.jeepDropX
+            world.jeepY = world.jeepStartY + (world.jeepDropY - world.jeepStartY) * ease
+            if (driveT < 1f) {
+                world.dustTimer -= dt
+                if (world.dustTimer <= 0f) {
+                    world.dustTimer = 0.07f
+                    world.particles.add(
+                        Particle(
+                            world.jeepX + (Random.nextFloat() - 0.5f) * 34f,
+                            world.jeepY + 50f,
+                            (Random.nextFloat() - 0.5f) * 16f, 12f,
+                            0.5f, 0.5f, 8f + Random.nextFloat() * 7f,
+                            Color(0xFFD6C29A), PT_DUST
+                        )
+                    )
+                }
+            }
+            if (t >= INTRO_DRIVE_END) {
+                val walkT = ((t - INTRO_DRIVE_END) / INTRO_WALK_LEN).coerceIn(0f, 1f)
+                val we = 1f - (1f - walkT) * (1f - walkT)
+                world.members.forEachIndexed { i, m ->
+                    val sx = world.jeepDropX + 58f
+                    val sy = world.jeepDropY - 14f + i * 26f
+                    val fx = world.anchorX + m.offX
+                    val fy = world.anchorY + m.offY
+                    m.x = sx + (fx - sx) * we
+                    m.y = sy + (fy - sy) * we
+                }
+            }
+            val introPit = world.particles.iterator()
+            while (introPit.hasNext()) {
+                val p = introPit.next()
+                p.ttl -= dt
+                if (p.ttl <= 0f) {
+                    introPit.remove()
+                    continue
+                }
+                if (p.kind == PT_DUST) {
+                    p.x += p.vx * dt
+                    p.y += p.vy * dt
+                }
+            }
+            if (t >= INTRO_LEN) world.finishIntro()
+            return
+        }
         world.elapsed += dt
         if (world.grenadeCd > 0f) world.grenadeCd = max(0f, world.grenadeCd - dt)
 
@@ -811,7 +1044,11 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
                 ?: continue
             val d = distBetween(e.x, e.y, nearest.x, nearest.y)
             if (d <= 300f) {
-                if (d > 170f) moveEnemyToward(e, nearest.x, nearest.y, 58f, dt)
+                // The tower sentry holds his platform: he fires with
+                // the standard stats but never approaches or patrols.
+                if (!e.stationary && d > 170f) {
+                    moveEnemyToward(e, nearest.x, nearest.y, 58f, dt)
+                }
                 if (e.cd <= 0f && d <= 320f) {
                     e.cd = 0.9f
                     // Visible projectile: flies at the member's position at
@@ -829,7 +1066,7 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
                         Effect(FX_HIT, e.x, e.y, e.x, e.y, 0.08f, 0.08f)
                     )
                 }
-            } else {
+            } else if (!e.stationary) {
                 val wx = e.ax + (cos((world.elapsed * 0.35f + e.phase).toDouble()) * 46.0).toFloat()
                 val wy = e.ay + (sin((world.elapsed * 0.27f + e.phase).toDouble()) * 30.0).toFloat()
                 moveEnemyToward(e, wx, wy, 26f, dt)
@@ -1018,15 +1255,27 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
         }
     }
 
+    // Frame-clock loop (v0.6.0): withFrameNanos instead of the old
+    // withFrameMillis stepping, dt clamped to 1/30 s so a hitched frame
+    // can never teleport the world. The stick vector is exponentially
+    // smoothed toward the raw target (dt-correct) — "makhan" movement.
     LaunchedEffect(Unit) {
-        var lastMs = -1L
+        var lastNs = -1L
         while (true) {
-            withFrameMillis { now ->
-                if (lastMs > 0L) {
-                    val dt = ((now - lastMs) / 1000f).coerceIn(0f, 0.05f)
+            withFrameNanos { now ->
+                if (lastNs > 0L) {
+                    val dt = ((now - lastNs) / 1_000_000_000f).coerceIn(0f, 1f / 30f)
+                    val k = 1f - exp(-dt * 18f)
+                    joyVec = Offset(
+                        joyVec.x + (joyTarget.x - joyVec.x) * k,
+                        joyVec.y + (joyTarget.y - joyVec.y) * k
+                    )
+                    if (joyTarget == Offset.Zero && joyVec.getDistance() < 0.5f) {
+                        joyVec = Offset.Zero
+                    }
                     stepGame(dt)
                 }
-                lastMs = now
+                lastNs = now
                 frameTick++
             }
         }
@@ -1039,58 +1288,75 @@ fun GameScreen(faction: Faction, onFinish: (Boolean, Int, Int, Float) -> Unit) {
                 .onSizeChanged { sz ->
                     if (sz.width > 0 && sz.height > 0 && !world.initialized) {
                         initWorld(world, sz.width.toFloat(), sz.height.toFloat())
+                        // No real art = no jeep: the intro is skipped
+                        // and the mission starts as before (v0.5.0).
+                        if (sprites == null) world.finishIntro()
                     }
                 }
                 .pointerInput(Unit) {
                     awaitPointerEventScope {
-                        var joyActive = false
-                        var pressPos: Offset? = null
-                        var tapStart: Offset? = null
+                        // Pointer-id joystick (v0.6.0). The old handler
+                        // read only the FIRST change of every event, so
+                        // a second finger (or the first finger's lift)
+                        // could steal or kill the stick mid-drag. Now:
+                        // the first finger down captures the stick by
+                        // id, only that id moves it, and only that id's
+                        // lift releases it — followed anywhere on the
+                        // canvas, no zone-drop. Other touches are
+                        // ignored while a stick is captured. A quick
+                        // tap (down+up < 250 ms, < 12 units of travel)
+                        // is NOT a stick drag: it is the revive tap.
+                        var stickId: PointerId? = null
+                        var stickBase = Offset.Zero
+                        var downPos = Offset.Zero
+                        var downTimeMs = 0L
                         while (true) {
                             val event = awaitPointerEvent()
-                            val change = event.changes.firstOrNull() ?: continue
-                            when {
-                                change.pressed && !change.previousPressed -> {
-                                    pressPos = change.position
-                                    if (change.position.x < size.width * 0.65f) {
-                                        // Floating joystick: the base is
-                                        // wherever the thumb lands.
-                                        joyActive = true
-                                        joyBase = change.position
-                                        joyVec = Offset.Zero
-                                    } else {
-                                        tapStart = change.position
+                            if (world.initialized && world.intro) {
+                                // Any fresh press skips the intro.
+                                if (event.changes.any {
+                                        it.pressed && !it.previousPressed
                                     }
+                                ) {
+                                    world.finishIntro()
                                 }
-                                change.pressed && joyActive -> {
-                                    val base = joyBase ?: change.position
-                                    val v = change.position - base
+                                continue
+                            }
+                            val sid = stickId
+                            if (sid != null) {
+                                val change = event.changes
+                                    .firstOrNull { it.id == sid } ?: continue
+                                if (change.pressed) {
+                                    val v = change.position - stickBase
                                     val l = v.getDistance()
-                                    joyVec = if (l > 60f) v / l * 60f else v
-                                }
-                                !change.pressed && change.previousPressed -> {
-                                    if (joyActive) {
-                                        joyActive = false
-                                        // A near-stationary press on the
-                                        // joystick side still counts as a
-                                        // tap (revive a downed member).
-                                        val pp = pressPos
-                                        if (pp != null &&
-                                            distBetween(
-                                                pp.x, pp.y,
-                                                change.position.x, change.position.y
-                                            ) < 24f
-                                        ) {
-                                            handleTap(pp)
-                                        }
-                                        joyVec = Offset.Zero
-                                        joyBase = null
-                                    } else {
-                                        tapStart?.let { handleTap(it) }
-                                        tapStart = null
+                                    joyTarget =
+                                        if (l > 60f) v / l * 60f else v
+                                } else {
+                                    // Only the captured finger's lift
+                                    // releases the stick.
+                                    val heldMs =
+                                        change.uptimeMillis - downTimeMs
+                                    val moved = distBetween(
+                                        downPos.x, downPos.y,
+                                        change.position.x, change.position.y
+                                    )
+                                    if (heldMs < 250L && moved < 12f) {
+                                        handleTap(downPos)
                                     }
-                                    pressPos = null
+                                    stickId = null
+                                    joyBase = null
+                                    joyTarget = Offset.Zero
                                 }
+                            } else {
+                                val fresh = event.changes.firstOrNull {
+                                    it.pressed && !it.previousPressed
+                                } ?: continue
+                                stickId = fresh.id
+                                stickBase = fresh.position
+                                downPos = fresh.position
+                                downTimeMs = fresh.uptimeMillis
+                                joyBase = fresh.position
+                                joyTarget = Offset.Zero
                             }
                         }
                     }
@@ -1816,7 +2082,16 @@ class SpriteAssets(
     val crate: ImageBitmap,
     val tower: ImageBitmap,
     val tree: ImageBitmap,
-    val medkit: ImageBitmap
+    val medkit: ImageBitmap,
+    // v0.6.0: ground textures, camp props and the title poster. If any
+    // of these fail to decode, the whole load fails (returns null) and
+    // the game keeps the v0.5.0 behaviour everywhere.
+    val texDirt: ImageBitmap,
+    val texWheat: ImageBitmap,
+    val texCrop: ImageBitmap,
+    val tent: ImageBitmap,
+    val jeep: ImageBitmap,
+    val poster: ImageBitmap
 )
 
 private fun loadSpriteAssets(context: Context): SpriteAssets? {
@@ -1853,7 +2128,13 @@ private fun loadSpriteAssets(context: Context): SpriteAssets? {
             crate = load("crate.b64").asImageBitmap(),
             tower = load("tower.b64").asImageBitmap(),
             tree = load("tree.b64").asImageBitmap(),
-            medkit = load("medkit.b64").asImageBitmap()
+            medkit = load("medkit.b64").asImageBitmap(),
+            texDirt = load("tex_dirt.b64").asImageBitmap(),
+            texWheat = load("tex_wheat.b64").asImageBitmap(),
+            texCrop = load("tex_crop.b64").asImageBitmap(),
+            tent = load("tent.b64").asImageBitmap(),
+            jeep = load("jeep.b64").asImageBitmap(),
+            poster = load("poster.b64").asImageBitmap()
         )
     } catch (e: Exception) {
         null
@@ -1929,6 +2210,34 @@ private fun DrawScope.tileRect(
             py += tileH
         }
     }
+}
+
+/**
+ * Stretch a texture over a rect with the DEFAULT filter quality
+ * (v0.6.0 ground textures only — sprite blits keep FilterQuality.None
+ * via [blit] so their pixels stay chunky).
+ */
+private fun DrawScope.stretch(
+    bmp: ImageBitmap,
+    x0: Float,
+    y0: Float,
+    x1: Float,
+    y1: Float
+) {
+    drawImage(
+        image = bmp,
+        dstOffset = IntOffset(x0.toInt(), y0.toInt()),
+        dstSize = IntSize(
+            (x1 - x0).toInt().coerceAtLeast(1),
+            (y1 - y0).toInt().coerceAtLeast(1)
+        )
+    )
+}
+
+/** Camp tent (real art 248x256 drawn 120x124), base at (x, baseY). */
+fun DrawScope.drawTent(assets: SpriteAssets, x: Float, baseY: Float) {
+    drawShadow(x, baseY + 4f, 52f, 8f)
+    blit(assets.tent, x - 60f, baseY - 124f, 120, 124)
 }
 
 /** Watchtower sprite (native 40x56 drawn 100x140), base at [baseY]. */
@@ -2176,17 +2485,6 @@ private fun DrawScope.drawGameWorld(
     val h = world.h
 
     // ---- Ground layer: dirt base, plots, road, canal, fence. ----
-    // Dirt bitmap tiled over the whole map: plots sit ON it, with dirt
-    // visible between them — no dark grid lines anywhere.
-    var dirtY = 0f
-    while (dirtY < h) {
-        var dirtX = 0f
-        while (dirtX < w) {
-            blit(art.dirt, dirtX, dirtY, 192, 192)
-            dirtX += 192f
-        }
-        dirtY += 192f
-    }
     // Plot kinds by the same index formula as the old colour palette:
     // 0 = green crop, 1 = light crop, 2 = wheat.
     val kindOf = listOf(0, 1, 2, 0, 1, 0)
@@ -2194,37 +2492,80 @@ private fun DrawScope.drawGameWorld(
     val rows = 6
     val cellW = w / cols
     val cellH = h / rows
-    for (i in 0 until cols) {
-        for (j in 0 until rows) {
-            val kind = kindOf[(i * 3 + j * 5 + i * j) % kindOf.size]
-            val variant = (i + j) % 2
-            val bmp = when (kind) {
-                0 -> if (variant == 0) art.cropA else art.cropB
-                1 -> if (variant == 0) art.lightA else art.lightB
-                else -> if (variant == 0) art.wheatA else art.wheatB
+    if (assets != null) {
+        // Dirt-dominant ground (v0.6.0): the real dirt texture IS the
+        // ground, stretched over the whole world — the field is mostly
+        // mitti now, with crop/wheat plots as patches on it. The old
+        // separate road strip is dropped; the dirt carries the scene.
+        stretch(assets.texDirt, 0f, 0f, w, h)
+        for (i in 0 until cols) {
+            for (j in 0 until rows) {
+                val kind = kindOf[(i * 3 + j * 5 + i * j) % kindOf.size]
+                val x0 = i * cellW + 4f
+                val y0 = j * cellH + 4f
+                val x1 = (i + 1) * cellW - 4f
+                val y1 = (j + 1) * cellH - 4f
+                stretch(
+                    if (kind == 2) assets.texWheat else assets.texCrop,
+                    x0, y0, x1, y1
+                )
+                drawRect(
+                    color = Color(0xFF5D4630).copy(alpha = 0.50f),
+                    topLeft = Offset(x0, y0),
+                    size = Size(x1 - x0, y1 - y0),
+                    style = Stroke(width = 3f)
+                )
+                drawRect(
+                    color = Color.Black.copy(alpha = 0.18f),
+                    topLeft = Offset(x0, y1 - 5f),
+                    size = Size(x1 - x0, 5f)
+                )
             }
-            val x0 = i * cellW + 4f
-            val y0 = j * cellH + 4f
-            val x1 = (i + 1) * cellW - 4f
-            val y1 = (j + 1) * cellH - 4f
-            tileRect(bmp, x0, y0, x1, y1)
-            drawRect(
-                color = Color(0xFF5D4630).copy(alpha = 0.50f),
-                topLeft = Offset(x0, y0),
-                size = Size(x1 - x0, y1 - y0),
-                style = Stroke(width = 3f)
-            )
-            drawRect(
-                color = Color.Black.copy(alpha = 0.18f),
-                topLeft = Offset(x0, y1 - 5f),
-                size = Size(x1 - x0, 5f)
-            )
         }
-    }
+    } else {
+        // Fallback ground (v0.5.0 behaviour, untouched): code-drawn
+        // dirt tiles under fully textured plots, plus the road strip.
+        var dirtY = 0f
+        while (dirtY < h) {
+            var dirtX = 0f
+            while (dirtX < w) {
+                blit(art.dirt, dirtX, dirtY, 192, 192)
+                dirtX += 192f
+            }
+            dirtY += 192f
+        }
+        for (i in 0 until cols) {
+            for (j in 0 until rows) {
+                val kind = kindOf[(i * 3 + j * 5 + i * j) % kindOf.size]
+                val variant = (i + j) % 2
+                val bmp = when (kind) {
+                    0 -> if (variant == 0) art.cropA else art.cropB
+                    1 -> if (variant == 0) art.lightA else art.lightB
+                    else -> if (variant == 0) art.wheatA else art.wheatB
+                }
+                val x0 = i * cellW + 4f
+                val y0 = j * cellH + 4f
+                val x1 = (i + 1) * cellW - 4f
+                val y1 = (j + 1) * cellH - 4f
+                tileRect(bmp, x0, y0, x1, y1)
+                drawRect(
+                    color = Color(0xFF5D4630).copy(alpha = 0.50f),
+                    topLeft = Offset(x0, y0),
+                    size = Size(x1 - x0, y1 - y0),
+                    style = Stroke(width = 3f)
+                )
+                drawRect(
+                    color = Color.Black.copy(alpha = 0.18f),
+                    topLeft = Offset(x0, y1 - 5f),
+                    size = Size(x1 - x0, 5f)
+                )
+            }
+        }
 
-    // Dirt road: bitmap strip (native 64x16 drawn 192x48) across the map.
-    val roadY = h * 0.545f
-    tileRect(art.road, 0f, roadY, w, roadY + 42f, tileW = 192, tileH = 48)
+        // Dirt road: bitmap strip (native 64x16 drawn 192x48).
+        val roadY = h * 0.545f
+        tileRect(art.road, 0f, roadY, w, roadY + 42f, tileW = 192, tileH = 48)
+    }
 
     // Canal along the right side: two baked variants alternate down the
     // strip, mud banks at both edges.
@@ -2271,8 +2612,10 @@ private fun DrawScope.drawGameWorld(
     }
 
     // Range ring: the squad's auto-fire radius around the formation
-    // centre, drawn under every entity.
-    if (world.members.isNotEmpty()) {
+    // centre, drawn under every entity. Hidden while the jeep is still
+    // driving in (the squad is not on the field yet).
+    val squadOnField = !(world.intro && world.introT < INTRO_DRIVE_END)
+    if (world.members.isNotEmpty() && squadOnField) {
         var ccx = 0f
         var ccy = 0f
         for (m in world.members) {
@@ -2296,8 +2639,28 @@ private fun DrawScope.drawGameWorld(
     // Sorted by base (feet) Y ascending: lower on screen draws later,
     // so it overlaps whatever stands higher up.
     val drawables = mutableListOf<Pair<Float, DrawScope.() -> Unit>>()
-    for (tx in listOf(w * 0.22f, w * 0.68f)) {
-        drawables.add(fenceBase to { drawWatchtower(art, tx, fenceBase, assets) })
+    for (t in world.towers) {
+        drawables.add(t.y to { drawWatchtower(art, t.x, t.y, assets) })
+    }
+    // Camp decor (real-art path only): tents and the smugglers' parked
+    // jeep, so the camps read as places. Purely visual.
+    if (assets != null) {
+        for (tentPos in world.tents) {
+            drawables.add(tentPos.y to { drawTent(assets, tentPos.x, tentPos.y) })
+        }
+        val cj = world.campJeep
+        if (cj != null) {
+            drawables.add(cj.y to {
+                drawShadow(cj.x, cj.y + 3f, 40f, 7f)
+                blit(assets.jeep, cj.x - 39f, cj.y - 102f, 78, 102)
+            })
+        }
+        // The squad's own jeep: driving in during the intro, parked at
+        // the drop point for the rest of the mission.
+        drawables.add(world.jeepY + 51f to {
+            drawShadow(world.jeepX, world.jeepY + 52f, 40f, 7f)
+            blit(assets.jeep, world.jeepX - 39f, world.jeepY - 51f, 78, 102)
+        })
     }
     for (o in world.obstacles) {
         if (o.tree) {
@@ -2317,9 +2680,13 @@ private fun DrawScope.drawGameWorld(
         val eFacing = if (target != null) {
             facingToward(e.x, e.y, target.x, target.y, Offset(0f, 1f))
         } else Offset(0f, 1f)
-        val eMoving = target == null ||
-            distBetween(e.x, e.y, target.x, target.y) > 172f
-        drawables.add(e.y to {
+        val eMoving = !e.stationary && (target == null ||
+            distBetween(e.x, e.y, target.x, target.y) > 172f)
+        // The sentry's sort key sits just past his tower's base so he
+        // draws AFTER (above) the tower sprite, standing on its
+        // platform, even though his feet are 105 units higher.
+        val eSortKey = if (e.stationary) e.y + 110f else e.y
+        drawables.add(eSortKey to {
             if (assets != null) {
                 drawAtlasFigure(
                     e.x, e.y, eFacing, world.elapsed, e.phase, eMoving,
@@ -2358,6 +2725,9 @@ private fun DrawScope.drawGameWorld(
     val memberAtlas = assets?.let { if (faction == Faction.PAKISTAN) it.pak else it.ind }
     val squadMoving = !holdOn && joyVec.getDistance() > 3f
     world.members.forEachIndexed { idx, m ->
+        // During the jeep drive-in the squad is still inside the jeep:
+        // members only appear for the step-out walk.
+        if (!squadOnField) return@forEachIndexed
         if (m.down) {
             drawables.add(m.y + 6f to { drawDownFigure(art, m.x, m.y) })
         } else {
@@ -2467,12 +2837,20 @@ private fun DrawScope.drawGameWorld(
     }
 
     // ---- Call-sign labels, drawn in the Canvas so they track the
-    // figures exactly (the old Compose overlay lagged behind). ----
-    for (m in world.members) {
-        if (m.down) {
-            drawCanvasText("DOWN", m.x, m.y - 30f, 30f, 0xFFFF5252.toInt())
-        } else {
-            drawCanvasText(m.name, m.x, m.y - 118f, 30f, 0xFFFFFFFF.toInt())
+    // figures exactly (the old Compose overlay lagged behind). Each
+    // label is staggered 13 units above the previous one (v0.6.0), so
+    // a bunched-up squad reads as a short stack, not one merged smear.
+    // ----
+    if (squadOnField) {
+        world.members.forEachIndexed { idx, m ->
+            if (m.down) {
+                drawCanvasText("DOWN", m.x, m.y - 30f, 30f, 0xFFFF5252.toInt())
+            } else {
+                drawCanvasText(
+                    m.name, m.x, m.y - 118f - idx * 13f, 30f,
+                    0xFFFFFFFF.toInt()
+                )
+            }
         }
     }
 }
